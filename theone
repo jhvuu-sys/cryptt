@@ -842,25 +842,183 @@ end
 
 createPanel()
 -- ============================================================================
--- LUI WALK FUNCTION   VIRTUAL INPUT FOR DIVE AND SPRINT
+-- ADDITION LAYER PART 1: THE SETTINGS UI PANEL
 -- ============================================================================
 
----------------------------------------------------------------------
--- Virtual Input & Auto-Action Configuration
----------------------------------------------------------------------
 local VirtualInputManager = game:GetService("VirtualInputManager")
 
 -- Configuration variables for the virtual key actions
 local ACTION_KEY = Enum.KeyCode.Three
-local TRIGGER_DISTANCE = 5      -- Distance (studs) from landing spot to fire the "3" input
+local TRIGGER_DISTANCE = 5      -- Default distance (studs) to fire the "3" input
 local FIRE_ONCE_PER_TRIP = true -- Prevents spamming "3" repeatedly on the same run
 
 -- Continuous spam configuration during the walk phase
 local SPAM_KEY = Enum.KeyCode.T
-local SPAM_INTERVAL = 0.05       -- Time (seconds) between each "T" keypress event
+local SPAM_INTERVAL = 0.1       -- Time (seconds) between each "T" keypress event
 
 ---------------------------------------------------------------------
--- Automated Ball Hunter Core Logic (With Dynamic Multiple Key Injection)
+-- Dynamic Settings UI Layer
+---------------------------------------------------------------------
+local CoreGui = game:GetService("CoreGui")
+local TweenService = game:GetService("TweenService")
+
+-- Create UI elements safely inside the client's screen space
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "WalkerSettingsUI"
+ScreenGui.ResetOnSpawn = false
+
+-- Attempt to protect the UI inside CoreGui; fallback to PlayerGui if restricted
+local success, _ = pcall(function() ScreenGui.Parent = CoreGui end)
+if not success then ScreenGui.Parent = player:WaitForChild("PlayerGui") end
+
+-- Main Panel Frame
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Size = UDim2.new(0, 220, 0, 90)
+MainFrame.Position = UDim2.new(1, -240, 0.5, -45) -- Anchor to right side of screen
+MainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Draggable = true -- Allows you to click and drag the panel anywhere
+MainFrame.Parent = ScreenGui
+
+local UICorner = Instance.new("UICorner")
+UICorner.CornerRadius = UDim.new(0, 8)
+UICorner.Parent = MainFrame
+
+local UIStroke = Instance.new("UIStroke")
+UIStroke.Color = Color3.fromRGB(55, 55, 60)
+UIStroke.Thickness = 1.5
+UIStroke.Parent = MainFrame
+
+-- Title Label
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Name = "TitleLabel"
+TitleLabel.Size = UDim2.new(1, 0, 0, 25)
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Text = "Trigger Distance Settings"
+TitleLabel.TextColor3 = Color3.fromRGB(240, 240, 245)
+TitleLabel.TextSize = 13
+TitleLabel.Font = Enum.Font.SourceSansBold
+TitleLabel.Parent = MainFrame
+
+-- Slider Background
+local SliderTrack = Instance.new("Frame")
+SliderTrack.Name = "SliderTrack"
+SliderTrack.Size = UDim2.new(0, 140, 0, 6)
+SliderTrack.Position = UDim2.new(0, 15, 0, 48)
+SliderTrack.BackgroundColor3 = Color3.fromRGB(50, 50, 55)
+SliderTrack.BorderSizePixel = 0
+SliderTrack.Parent = MainFrame
+
+local SliderCorner = Instance.new("UICorner")
+SliderCorner.CornerRadius = UDim.new(0, 3)
+SliderCorner.Parent = SliderTrack
+
+-- Slider Fill Bar
+local SliderFill = Instance.new("Frame")
+SliderFill.Name = "SliderFill"
+SliderFill.Size = UDim2.new(0, 0, 1, 0)
+SliderFill.BackgroundColor3 = Color3.fromRGB(70, 160, 255)
+SliderFill.BorderSizePixel = 0
+SliderFill.Parent = SliderTrack
+
+local FillCorner = Instance.new("UICorner")
+FillCorner.CornerRadius = UDim.new(0, 3)
+FillCorner.Parent = SliderFill
+
+-- Slider Interactive Button Knob
+local SliderKnob = Instance.new("TextButton")
+SliderKnob.Name = "SliderKnob"
+SliderKnob.Size = UDim2.new(0, 14, 0, 14)
+SliderKnob.Position = UDim2.new(0, -7, 0.5, -7)
+SliderKnob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+SliderKnob.Text = ""
+SliderKnob.Parent = SliderTrack
+
+local KnobCorner = Instance.new("UICorner")
+KnobCorner.CornerRadius = UDim.new(1, 0)
+KnobCorner.Parent = SliderKnob
+
+-- Value Box (Editable Textbox)
+local ValueBox = Instance.new("TextBox")
+ValueBox.Name = "ValueBox"
+ValueBox.Size = UDim2.new(0, 45, 0, 24)
+ValueBox.Position = UDim2.new(0, 160, 0, 39)
+ValueBox.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
+ValueBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+ValueBox.TextSize = 14
+ValueBox.Font = Enum.Font.SourceSansBold
+ValueBox.Text = tostring(TRIGGER_DISTANCE)
+ValueBox.Parent = MainFrame
+
+local BoxCorner = Instance.new("UICorner")
+BoxCorner.CornerRadius = UDim.new(0, 4)
+BoxCorner.Parent = ValueBox
+
+local BoxStroke = Instance.new("UIStroke")
+BoxStroke.Color = Color3.fromRGB(65, 65, 70)
+BoxStroke.Thickness = 1
+BoxStroke.Parent = ValueBox
+
+-- Dynamic UI Math Configuration Range (Min 1 stud, Max 25 studs)
+local MIN_DIST = 1
+local MAX_DIST = 25
+
+local function updateDistanceValue(newValue)
+    TRIGGER_DISTANCE = math.clamp(math.round(newValue * 10) / 10, MIN_DIST, MAX_DIST)
+    ValueBox.Text = tostring(TRIGGER_DISTANCE)
+    
+    local percentage = (TRIGGER_DISTANCE - MIN_DIST) / (MAX_DIST - MIN_DIST)
+    TweenService:Create(SliderKnob, TweenInfo.new(0.05, Enum.EasingStyle.Quad), {Position = UDim2.new(percentage, -7, 0.5, -7)}):Play()
+    TweenService:Create(SliderFill, TweenInfo.new(0.05, Enum.EasingStyle.Quad), {Size = UDim2.new(percentage, 0, 1, 0)}):Play()
+end
+
+-- Initialize slider position accurately on load
+updateDistanceValue(TRIGGER_DISTANCE)
+
+-- Handle Interactive Slider Dragging Operations
+local isDragging = false
+SliderKnob.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        isDragging = true
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        isDragging = false
+    end
+end)
+
+RunService.RenderStepped:Connect(function()
+    if isDragging then
+        local mousePos = UserInputService:GetMouseLocation().X
+        local trackLeftEdge = SliderTrack.AbsolutePosition.X
+        local trackWidth = SliderTrack.AbsoluteSize.X
+        
+        local relativePercentage = math.clamp((mousePos - trackLeftEdge) / trackWidth, 0, 1)
+        local rawCalculatedValue = MIN_DIST + (relativePercentage * (MAX_DIST - MIN_DIST))
+        updateDistanceValue(rawCalculatedValue)
+    end
+end)
+
+-- Handle Manual Textbox Focus Input Changes
+ValueBox.FocusLost:Connect(function(enterPressed)
+    local enteredNum = tonumber(ValueBox.Text)
+    if enteredNum then
+        updateDistanceValue(enteredNum)
+    else
+        ValueBox.Text = tostring(TRIGGER_DISTANCE)
+    end
+end)
+
+-- ============================================================================
+-- ADDITION LAYER PART 2: THE AUTOMATION LOGIC LOOPS
+-- ============================================================================
+
+---------------------------------------------------------------------
+-- Automated Ball Hunter Core Logic (With Dynamic Distance Variable)
 ---------------------------------------------------------------------
 local function triggerAutomatedBallWalk()
     if not walkEnabled or not root or not humanoid then return end
@@ -925,20 +1083,22 @@ local function triggerAutomatedBallWalk()
                 local remDist = (currentLandPos - currentPos).Magnitude
 
                 -- 1) CONTINUOUS ACTION: Fire the "T" key multiple times while walking
-                local currentTime = os.clock()
-                if (currentTime - lastSpamTime) >= SPAM_INTERVAL then
-                    lastSpamTime = currentTime
-                    task.spawn(function()
-                        VirtualInputManager:SendKeyEvent(true, SPAM_KEY, false, game)
-                        task.wait(0.02)
-                        VirtualInputManager:SendKeyEvent(false, SPAM_KEY, false, game)
-                    end)
+                if not hasFiredInput3 then
+                    local currentTime = os.clock()
+                    if (currentTime - lastSpamTime) >= SPAM_INTERVAL then
+                        lastSpamTime = currentTime
+                        task.spawn(function()
+                            VirtualInputManager:SendKeyEvent(true, SPAM_KEY, false, game)
+                            task.wait(0.02)
+                            VirtualInputManager:SendKeyEvent(false, SPAM_KEY, false, game)
+                        end)
+                    end
                 end
 
-                -- 2) PROXIMITY ACTION: Check distance threshold to inject the virtual "3" key
+                -- 2) PROXIMITY ACTION: Check dynamic distance threshold to inject the virtual "3" key
                 if remDist <= TRIGGER_DISTANCE then
                     if not FIRE_ONCE_PER_TRIP or not hasFiredInput3 then
-                        hasFiredInput3 = true
+                        hasFiredInput3 = true 
                         
                         task.spawn(function()
                             VirtualInputManager:SendKeyEvent(true, ACTION_KEY, false, game)
