@@ -1,0 +1,42 @@
+-- Table to hold the intercepted functions from the game's scripts
+local interceptedCallbacks = {}
+
+-- 1. Gain access to the game engine's protected metatable
+local gameMeta = getrawmetatable(game)
+local originalIndex = gameMeta.__index
+
+-- 2. Hook the __index metamethod to catch when scripts access "Connect"
+setreadonly(gameMeta, false) -- Allow editing of the protected metatable
+gameMeta.__index = newcclosure(function(object, key)
+    -- If a script is trying to use a method on the real InputBegan signal
+    if object == game:GetService("UserInputService").InputBegan and key == "Connect" then
+        return newcclosure(function(signal, callback)
+            -- Intercept and save the game's original function
+            table.insert(interceptedCallbacks, callback)
+            print("[Hook] Successfully intercepted an InputBegan listener!")
+            
+            -- Pass it along to the real Connect function so nothing breaks
+            return originalIndex(signal, key)(signal, callback)
+        end)
+    end
+    return originalIndex(object, key)
+end)
+setreadonly(gameMeta, true) -- Re-lock the metatable for safety
+
+-- ============================================================================
+-- BYPASS TRIGGER: Call this to force the intercepted scripts to execute "3"
+-- ============================================================================
+local function forceVirtualThreeViaHook()
+    local mockInput = {
+        KeyCode = Enum.KeyCode.Three,
+        UserInputType = Enum.UserInputType.Keyboard
+    }
+    
+    for _, callback in ipairs(interceptedCallbacks) do
+        task.spawn(callback, mockInput, false)
+    end
+end
+
+-- Example trigger: Run this whenever you want to trigger the spin
+task.wait(1)
+forceVirtualThreeViaHook()
