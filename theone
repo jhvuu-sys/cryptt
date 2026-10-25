@@ -8,6 +8,8 @@ local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local CoreGui = game:GetService("CoreGui")
 
 local player = Players.LocalPlayer
 
@@ -23,10 +25,10 @@ local GIVE_UP_TIME = 8         -- stop trying after this many seconds
 ---------------------------------------------------------------------
 -- Settings: ball landing predictor
 ---------------------------------------------------------------------
-local BALL_NAME = "Ball"          -- every Part or Model with this name is tracked AND is what E walks to
-local MAX_BALLS = 10              -- safety cap on how many balls are tracked at once
+local BALL_NAME = "Ball"         -- every Part or Model with this name is tracked AND is what E walks to
+local MAX_BALLS = 10             -- safety cap on how many balls are tracked at once
 local STEP = 1 / 30               -- simulation step (seconds)
-local MAX_TIME = 6                -- how far ahead to predict (seconds)
+local MAX_TIME = 6               -- how far ahead to predict (seconds)
 
 local IGNORE_INVISIBLE = true     -- skip parts that are (nearly) transparent
 local INVISIBLE_THRESHOLD = 0.95  -- Transparency at or above this counts as invisible
@@ -274,7 +276,7 @@ end
 -- Predictor: prediction
 ---------------------------------------------------------------------
 local skipped = setmetatable({}, { __mode = "k" })  -- invisible parts we've learned to ignore
-local rayParams                                      -- shared by all balls, rebuilt each frame
+local rayParams                                    -- shared by all balls, rebuilt each frame
 
 local function buildRayParams()
     local ignore = { markerFolder, arcFolder, highlightFolder }
@@ -351,10 +353,7 @@ end
 
 ---------------------------------------------------------------------
 -- Predictor: motion tracking
--- Reading one frame of position/velocity is noisy (network updates arrive in steps), which
--- makes the arc jitter. Instead, fit the last fraction of a second of positions to a gravity arc.
 ---------------------------------------------------------------------
--- Returns the smoothed position and velocity at the latest sample, or nil if there isn't enough data
 local function fitMotion(history, gravity)
     local n = #history
     if n < MIN_SAMPLES then return nil end
@@ -382,7 +381,6 @@ local function fitMotion(history, gravity)
     return pos, vel
 end
 
--- Returns the smoothed position, velocity, and whether the ball just left its arc (bounce, hit, teleport)
 local function updateMotion(data, part, gravity)
     local now = os.clock()
     local history = data.history
@@ -412,7 +410,6 @@ local function updateMotion(data, part, gravity)
         return fitPos, fitVel, bounced
     end
 
-    -- not enough samples yet: fall back to what the engine reports
     data.fitPos = nil
     return pos, part.AssemblyLinearVelocity, bounced
 end
@@ -433,7 +430,6 @@ RunService.Heartbeat:Connect(function(dt)
             local radius = getRadius(data, part)
 
             if not data.dead then
-                -- Did it just land? (reached the predicted spot, or bounced right next to it)
                 local last = data.landing
                 if last then
                     local away = (pos - last).Magnitude
@@ -449,7 +445,6 @@ RunService.Heartbeat:Connect(function(dt)
                 local landing, points = predictLanding(pos, vel, radius, gravity)
 
                 if landing then
-                    -- glide the landing spot toward each new estimate so it doesn't twitch
                     local prev = data.landing
                     if prev and (landing - prev).Magnitude < SNAP_DISTANCE then
                         landing = prev:Lerp(landing, 1 - math.exp(-SMOOTHING * dt))
@@ -459,7 +454,6 @@ RunService.Heartbeat:Connect(function(dt)
                     data.landing = nil
                 end
 
-                -- the panel switches only control what is drawn; tracking (and walking) keeps running
                 if enabled and landing then
                     data.marker.Transparency = 0.35
                     data.marker.CFrame = CFrame.new(landing + Vector3.new(0, 0.1, 0))
@@ -485,10 +479,8 @@ RunService.Heartbeat:Connect(function(dt)
 end)
 
 ---------------------------------------------------------------------
--- Walk to ball (goes right onto its predicted landing spot)
+-- Walk to ball & Action trigger implementation
 ---------------------------------------------------------------------
--- Where we want to stand: the predicted landing spot if there is one,
--- otherwise the ball itself (no prediction yet). Dead (landed) balls are ignored.
 local function getGoal(data)
     if data.dead then return nil end
     local part = getPart(data)
@@ -496,7 +488,6 @@ local function getGoal(data)
     return data.landing or part.Position
 end
 
--- Returns the tracked ball whose goal point is closest and on the chosen side
 local function findBall()
     local best, bestDist = nil, math.huge
     for _, data in pairs(balls) do
@@ -523,8 +514,14 @@ end
 local function stopMoving()
     runId += 1
     if humanoid and root then
-        humanoid:MoveTo(root.Position)  -- moving to where we already are cancels the walk
+        humanoid:MoveTo(root.Position)
     end
+end
+
+local function simulateKeyPress(keyCode)
+    VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
+    task.wait(0.05)
+    VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
 end
 
 local function walkTo(data)
@@ -532,11 +529,11 @@ local function walkTo(data)
     local myId = runId
     local startTime = os.clock()
     local lastCommand = 0
-    local lastGoal  -- if the ball lands mid-trip, keep going to where it landed
+    local lastGoal
+    local actionFired = false
 
     local conn
     conn = RunService.Heartbeat:Connect(function()
-        -- Cancelled, died, or the ball was removed
         if runId ~= myId or humanoid.Health <= 0 or balls[data.inst] ~= data then
             conn:Disconnect()
             return
@@ -552,6 +549,25 @@ local function walkTo(data)
         local offset = goal - root.Position
         local flatDist = Vector3.new(offset.X, 0, offset.Z).Magnitude
 
+        -- Configuration variables for virtual key actions & rotation snap
+        local TRIGGER_DISTANCE = 5      -- Distance (studs) to snap rotation and fire key "3"
+        local ACTION_KEY = Enum.KeyCode.Three
+        local FIRE_ONCE_PER_TRIP = true
+
+        -- Check if we are within trigger distance to snap rotation and input "3"
+        if flatDist <= TRIGGER_DISTANCE and not actionFired then
+            if FIRE_ONCE_PER_TRIP then
+                actionFired = true
+            end
+
+            -- Snap character orientation horizontally (Yaw only) to look directly at the target marker/goal
+            local lookTarget = Vector3.new(goal.X, root.Position.Y, goal.Z)
+            root.CFrame = CFrame.lookAt(root.Position, lookTarget)
+
+            -- Simulate pressing key "3"
+            simulateKeyPress(ACTION_KEY)
+        end
+
         -- Arrived, or took too long
         if flatDist <= walkStop or os.clock() - startTime > GIVE_UP_TIME then
             conn:Disconnect()
@@ -559,8 +575,6 @@ local function walkTo(data)
             return
         end
 
-        -- MoveTo expires after ~8 s and the goal keeps changing as the prediction updates,
-        -- so re-issue it a few times per second
         if os.clock() - lastCommand > 0.25 then
             lastCommand = os.clock()
             humanoid:MoveTo(goal)
@@ -568,7 +582,6 @@ local function walkTo(data)
     end)
 end
 
--- Starts a trip to the best ball (used by the key and by the panel's Walk Now button)
 local function startWalk()
     if not walkEnabled then return end
     if not (humanoid and root) or humanoid.Health <= 0 then return end
@@ -579,13 +592,11 @@ local function startWalk()
     end
 end
 
--- Single input handler. `processed` is true while typing in the hex box,
--- so pressing the key there will not start a trip.
 UserInputService.InputBegan:Connect(function(input, processed)
-    if listeningForKey then  -- the panel's Key button is waiting for a new key
+    if listeningForKey then
         if input.UserInputType == Enum.UserInputType.Keyboard then
             listeningForKey = false
-            if input.KeyCode ~= Enum.KeyCode.Escape then  -- Escape cancels
+            if input.KeyCode ~= Enum.KeyCode.Escape then
                 triggerKey = input.KeyCode
             end
             if refreshKeyButton then refreshKeyButton() end
@@ -609,9 +620,15 @@ end
 
 local function createPanel()
     local gui = Instance.new("ScreenGui")
-    gui.Name = "MarkerColorPanel"
+    gui.Name = "WalkerSettingsUI"
     gui.ResetOnSpawn = false
-    gui.Parent = player:WaitForChild("PlayerGui")
+    
+    local success = pcall(function()
+        gui.Parent = CoreGui
+    end)
+    if not success then
+        gui.Parent = player:WaitForChild("PlayerGui")
+    end
 
     local frame = Instance.new("Frame")
     frame.Size = UDim2.new(0, 230, 0, 388)
@@ -619,7 +636,7 @@ local function createPanel()
     frame.BackgroundColor3 = Color3.fromRGB(30, 30, 34)
     frame.BorderSizePixel = 0
     frame.Active = true
-    frame.Draggable = true  -- deprecated but still works; drag the panel anywhere
+    frame.Draggable = true
     frame.Parent = gui
     Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
 
@@ -698,7 +715,7 @@ local function createPanel()
                 tonumber(hex:sub(5, 6), 16)
             ))
         else
-            hexBox.Text = ""  -- invalid input, keep the current color
+            hexBox.Text = ""
         end
     end)
 
@@ -731,9 +748,6 @@ local function createPanel()
         end
     end)
 
-    -----------------------------------------------------------------
-    -- Walking section
-    -----------------------------------------------------------------
     local divider = Instance.new("Frame")
     divider.Size = UDim2.new(1, -20, 0, 1)
     divider.Position = UDim2.new(0, 10, 0, 172)
@@ -770,7 +784,6 @@ local function createPanel()
         return btn
     end
 
-    -- "-  value  +" control
     local function makeStepper(y, get, set, step, min, max)
         local minus = makeButton("-", 110, y, 24, 24)
         local plus = makeButton("+", 186, y, 24, 24)
@@ -809,7 +822,7 @@ local function createPanel()
     walkToggleBtn.Activated:Connect(function()
         walkEnabled = not walkEnabled
         styleToggle(walkToggleBtn, walkEnabled)
-        if not walkEnabled then stopMoving() end  -- cancel a trip in progress
+        if not walkEnabled then stopMoving() end
     end)
 
     makeLabel("Side", 218)
@@ -841,299 +854,4 @@ local function createPanel()
 end
 
 createPanel()
--- ============================================================================
--- ADDITION LAYER PART 1: THE SETTINGS UI PANEL
--- ============================================================================
-
-local VirtualInputManager = game:GetService("VirtualInputManager")
-
--- Configuration variables for the virtual key actions
-local ACTION_KEY = Enum.KeyCode.Three
-local TRIGGER_DISTANCE = 5      -- Default distance (studs) to fire the "3" input
-local FIRE_ONCE_PER_TRIP = true -- Prevents spamming "3" repeatedly on the same run
-
--- Continuous spam configuration during the walk phase
-local SPAM_KEY = Enum.KeyCode.T
-local SPAM_INTERVAL = 0.1       -- Time (seconds) between each "T" keypress event
-
----------------------------------------------------------------------
--- Dynamic Settings UI Layer
----------------------------------------------------------------------
-local CoreGui = game:GetService("CoreGui")
-local TweenService = game:GetService("TweenService")
-
--- Create UI elements safely inside the client's screen space
-local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "WalkerSettingsUI"
-ScreenGui.ResetOnSpawn = false
-
--- Attempt to protect the UI inside CoreGui; fallback to PlayerGui if restricted
-local success, _ = pcall(function() ScreenGui.Parent = CoreGui end)
-if not success then ScreenGui.Parent = player:WaitForChild("PlayerGui") end
-
--- Main Panel Frame
-local MainFrame = Instance.new("Frame")
-MainFrame.Name = "MainFrame"
-MainFrame.Size = UDim2.new(0, 220, 0, 90)
-MainFrame.Position = UDim2.new(1, -240, 0.5, -45) -- Anchor to right side of screen
-MainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
-MainFrame.BorderSizePixel = 0
-MainFrame.Active = true
-MainFrame.Draggable = true -- Allows you to click and drag the panel anywhere
-MainFrame.Parent = ScreenGui
-
-local UICorner = Instance.new("UICorner")
-UICorner.CornerRadius = UDim.new(0, 8)
-UICorner.Parent = MainFrame
-
-local UIStroke = Instance.new("UIStroke")
-UIStroke.Color = Color3.fromRGB(55, 55, 60)
-UIStroke.Thickness = 1.5
-UIStroke.Parent = MainFrame
-
--- Title Label
-local TitleLabel = Instance.new("TextLabel")
-TitleLabel.Name = "TitleLabel"
-TitleLabel.Size = UDim2.new(1, 0, 0, 25)
-TitleLabel.BackgroundTransparency = 1
-TitleLabel.Text = "Trigger Distance Settings"
-TitleLabel.TextColor3 = Color3.fromRGB(240, 240, 245)
-TitleLabel.TextSize = 13
-TitleLabel.Font = Enum.Font.SourceSansBold
-TitleLabel.Parent = MainFrame
-
--- Slider Background
-local SliderTrack = Instance.new("Frame")
-SliderTrack.Name = "SliderTrack"
-SliderTrack.Size = UDim2.new(0, 140, 0, 6)
-SliderTrack.Position = UDim2.new(0, 15, 0, 48)
-SliderTrack.BackgroundColor3 = Color3.fromRGB(50, 50, 55)
-SliderTrack.BorderSizePixel = 0
-SliderTrack.Parent = MainFrame
-
-local SliderCorner = Instance.new("UICorner")
-SliderCorner.CornerRadius = UDim.new(0, 3)
-SliderCorner.Parent = SliderTrack
-
--- Slider Fill Bar
-local SliderFill = Instance.new("Frame")
-SliderFill.Name = "SliderFill"
-SliderFill.Size = UDim2.new(0, 0, 1, 0)
-SliderFill.BackgroundColor3 = Color3.fromRGB(70, 160, 255)
-SliderFill.BorderSizePixel = 0
-SliderFill.Parent = SliderTrack
-
-local FillCorner = Instance.new("UICorner")
-FillCorner.CornerRadius = UDim.new(0, 3)
-FillCorner.Parent = SliderFill
-
--- Slider Interactive Button Knob
-local SliderKnob = Instance.new("TextButton")
-SliderKnob.Name = "SliderKnob"
-SliderKnob.Size = UDim2.new(0, 14, 0, 14)
-SliderKnob.Position = UDim2.new(0, -7, 0.5, -7)
-SliderKnob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-SliderKnob.Text = ""
-SliderKnob.Parent = SliderTrack
-
-local KnobCorner = Instance.new("UICorner")
-KnobCorner.CornerRadius = UDim.new(1, 0)
-KnobCorner.Parent = SliderKnob
-
--- Value Box (Editable Textbox)
-local ValueBox = Instance.new("TextBox")
-ValueBox.Name = "ValueBox"
-ValueBox.Size = UDim2.new(0, 45, 0, 24)
-ValueBox.Position = UDim2.new(0, 160, 0, 39)
-ValueBox.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
-ValueBox.TextColor3 = Color3.fromRGB(255, 255, 255)
-ValueBox.TextSize = 14
-ValueBox.Font = Enum.Font.SourceSansBold
-ValueBox.Text = tostring(TRIGGER_DISTANCE)
-ValueBox.Parent = MainFrame
-
-local BoxCorner = Instance.new("UICorner")
-BoxCorner.CornerRadius = UDim.new(0, 4)
-BoxCorner.Parent = ValueBox
-
-local BoxStroke = Instance.new("UIStroke")
-BoxStroke.Color = Color3.fromRGB(65, 65, 70)
-BoxStroke.Thickness = 1
-BoxStroke.Parent = ValueBox
-
--- Dynamic UI Math Configuration Range (Min 1 stud, Max 25 studs)
-local MIN_DIST = 1
-local MAX_DIST = 25
-
-local function updateDistanceValue(newValue)
-    TRIGGER_DISTANCE = math.clamp(math.round(newValue * 10) / 10, MIN_DIST, MAX_DIST)
-    ValueBox.Text = tostring(TRIGGER_DISTANCE)
-    
-    local percentage = (TRIGGER_DISTANCE - MIN_DIST) / (MAX_DIST - MIN_DIST)
-    TweenService:Create(SliderKnob, TweenInfo.new(0.05, Enum.EasingStyle.Quad), {Position = UDim2.new(percentage, -7, 0.5, -7)}):Play()
-    TweenService:Create(SliderFill, TweenInfo.new(0.05, Enum.EasingStyle.Quad), {Size = UDim2.new(percentage, 0, 1, 0)}):Play()
-end
-
--- Initialize slider position accurately on load
-updateDistanceValue(TRIGGER_DISTANCE)
-
--- Handle Interactive Slider Dragging Operations
-local isDragging = false
-SliderKnob.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        isDragging = true
-    end
-end)
-
-UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        isDragging = false
-    end
-end)
-
-RunService.RenderStepped:Connect(function()
-    if isDragging then
-        local mousePos = UserInputService:GetMouseLocation().X
-        local trackLeftEdge = SliderTrack.AbsolutePosition.X
-        local trackWidth = SliderTrack.AbsoluteSize.X
-        
-        local relativePercentage = math.clamp((mousePos - trackLeftEdge) / trackWidth, 0, 1)
-        local rawCalculatedValue = MIN_DIST + (relativePercentage * (MAX_DIST - MIN_DIST))
-        updateDistanceValue(rawCalculatedValue)
-    end
-end)
-
--- Handle Manual Textbox Focus Input Changes
-ValueBox.FocusLost:Connect(function(enterPressed)
-    local enteredNum = tonumber(ValueBox.Text)
-    if enteredNum then
-        updateDistanceValue(enteredNum)
-    else
-        ValueBox.Text = tostring(TRIGGER_DISTANCE)
-    end
-end)
-
--- ============================================================================
--- ADDITION LAYER PART 2: THE AUTOMATION LOGIC LOOPS
--- ============================================================================
-
----------------------------------------------------------------------
--- Automated Ball Hunter Core Logic (With Dynamic Distance Variable)
----------------------------------------------------------------------
-local function triggerAutomatedBallWalk()
-    if not walkEnabled or not root or not humanoid then return end
-
-    local charPos = root.Position
-    local bestBallData = nil
-    local bestDistance = walkRange
-
-    -- Find the closest valid ball matching your panel settings
-    for inst, data in pairs(balls) do
-        if not data.dead and data.landing then
-            local part = getPart(data)
-            if part then
-                local isTransparent = part:IsA("BasePart") and part.Transparency >= INVISIBLE_THRESHOLD
-                if not (IGNORE_INVISIBLE and isTransparent) then
-                    
-                    local landPos = data.landing
-                    local distance = (landPos - charPos).Magnitude
-
-                    if distance <= bestDistance then
-                        -- Directional panel check (Right/Left/Any)
-                        local toLanding = (landPos - charPos).Unit
-                        local lookVector = root.CFrame.LookVector
-                        local rightVector = root.CFrame.RightVector
-                        
-                        local forwardDot = lookVector:Dot(toLanding)
-                        local rightDot = rightVector:Dot(toLanding)
-
-                        local sideMatches = false
-                        if walkSide == "Any" then
-                            sideMatches = true
-                        elseif walkSide == "Right" and rightDot >= SIDE_THRESHOLD and forwardDot >= -0.2 then
-                            sideMatches = true
-                        elseif walkSide == "Left" and rightDot <= -SIDE_THRESHOLD and forwardDot >= -0.2 then
-                            sideMatches = true
-                        end
-
-                        if sideMatches then
-                            bestDistance = distance
-                            bestBallData = data
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    -- Execute walking path and dual key injection sequences
-    if bestBallData then
-        runId += 1
-        local currentRunId = runId
-        local hasFiredInput3 = false -- Track fire state for the "3" key trip
-        local lastSpamTime = 0       -- Track cadence for the "T" key spam
-        
-        task.spawn(function()
-            local startTime = os.clock()
-            local targetLandPos = bestBallData.landing
-            
-            while runId == currentRunId and bestBallData.inst.Parent and not bestBallData.dead do
-                local currentPos = root.Position
-                local currentLandPos = bestBallData.landing or targetLandPos
-                local remDist = (currentLandPos - currentPos).Magnitude
-
-                -- 1) CONTINUOUS ACTION: Fire the "T" key multiple times while walking
-                if not hasFiredInput3 then
-                    local currentTime = os.clock()
-                    if (currentTime - lastSpamTime) >= SPAM_INTERVAL then
-                        lastSpamTime = currentTime
-                        task.spawn(function()
-                            VirtualInputManager:SendKeyEvent(true, SPAM_KEY, false, game)
-                            task.wait(0.02)
-                            VirtualInputManager:SendKeyEvent(false, SPAM_KEY, false, game)
-                        end)
-                    end
-                end
-
-                -- 2) PROXIMITY ACTION: Check dynamic distance threshold to inject the virtual "3" key
-                if remDist <= TRIGGER_DISTANCE then
-                    if not FIRE_ONCE_PER_TRIP or not hasFiredInput3 then
-                        hasFiredInput3 = true 
-                        
-                        task.spawn(function()
-                            VirtualInputManager:SendKeyEvent(true, ACTION_KEY, false, game)
-                            task.wait(0.05)
-                            VirtualInputManager:SendKeyEvent(false, ACTION_KEY, false, game)
-                        end)
-                    end
-                end
-
-                -- Stopping conditions
-                if remDist <= walkStop then break end
-                if (os.clock() - startTime) > GIVE_UP_TIME then break end
-
-                -- Force step movement directly towards target coordinate
-                humanoid:MoveTo(currentLandPos)
-                RunService.Heartbeat:Wait()
-            end
-            
-            -- Stop moving character cleanly if the trip ends or updates
-            if runId == currentRunId then
-                humanoid:MoveTo(root.Position)
-            end
-        end)
-    end
-end
-
----------------------------------------------------------------------
--- Hardware Trigger Hooks
----------------------------------------------------------------------
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    if gameProcessed or listeningForKey then return end
-    if input.KeyCode == triggerKey then
-        triggerAutomatedBallWalk()
-    end
-end)
-
--- Store a global reference hook so other scripts or panels can invoke it instantly
-_G.ForceBallWalkTrigger = triggerAutomatedBallWalk
+print("Combined Script with Auto-Rotation and UI Extension Loaded!")
