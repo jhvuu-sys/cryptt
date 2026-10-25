@@ -14,6 +14,123 @@ local CoreGui = game:GetService("CoreGui")
 local player = Players.LocalPlayer
 
 ---------------------------------------------------------------------
+-- Key system: nothing below this section (no UI, no ball tracking, no input) runs until a valid key is entered
+---------------------------------------------------------------------
+local VALID_KEYS = {
+    ["CHANGE-ME-1234"] = true,  -- put your keys here (case-sensitive)
+}
+local KEY_MAX_ATTEMPTS = 3        -- wrong tries before a short lockout
+local KEY_LOCKOUT_SECONDS = 30
+
+local function waitForKey()
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "KeyPrompt"
+    gui.ResetOnSpawn = false
+    local parented = pcall(function()
+        gui.Parent = CoreGui
+    end)
+    if not parented then
+        gui.Parent = player:WaitForChild("PlayerGui")
+    end
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(0, 300, 0, 160)
+    frame.AnchorPoint = Vector2.new(0.5, 0.5)
+    frame.Position = UDim2.new(0.5, 0, 0.5, 0)
+    frame.BackgroundColor3 = Color3.fromRGB(30, 30, 34)
+    frame.BorderSizePixel = 0
+    frame.Active = true
+    frame.Draggable = true
+    frame.Parent = gui
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -20, 0, 28)
+    title.Position = UDim2.new(0, 10, 0, 10)
+    title.BackgroundTransparency = 1
+    title.Text = "Enter your key to unlock"
+    title.TextColor3 = Color3.new(1, 1, 1)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 15
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = frame
+
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.new(1, -20, 0, 32)
+    box.Position = UDim2.new(0, 10, 0, 46)
+    box.BackgroundColor3 = Color3.fromRGB(50, 50, 58)
+    box.BorderSizePixel = 0
+    box.PlaceholderText = "Key"
+    box.Text = ""
+    box.TextColor3 = Color3.new(1, 1, 1)
+    box.Font = Enum.Font.Gotham
+    box.TextSize = 14
+    box.ClearTextOnFocus = false
+    box.Parent = frame
+    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 5)
+
+    local submitBtn = Instance.new("TextButton")
+    submitBtn.Size = UDim2.new(1, -20, 0, 32)
+    submitBtn.Position = UDim2.new(0, 10, 0, 86)
+    submitBtn.BackgroundColor3 = Color3.fromRGB(60, 110, 200)
+    submitBtn.BorderSizePixel = 0
+    submitBtn.Text = "Unlock"
+    submitBtn.TextColor3 = Color3.new(1, 1, 1)
+    submitBtn.Font = Enum.Font.GothamBold
+    submitBtn.TextSize = 14
+    submitBtn.Parent = frame
+    Instance.new("UICorner", submitBtn).CornerRadius = UDim.new(0, 5)
+
+    local status = Instance.new("TextLabel")
+    status.Size = UDim2.new(1, -20, 0, 24)
+    status.Position = UDim2.new(0, 10, 0, 126)
+    status.BackgroundTransparency = 1
+    status.Text = ""
+    status.TextColor3 = Color3.fromRGB(220, 90, 90)
+    status.Font = Enum.Font.GothamMedium
+    status.TextSize = 13
+    status.TextXAlignment = Enum.TextXAlignment.Left
+    status.Parent = frame
+
+    local unlocked = Instance.new("BindableEvent")
+    local attempts, lockedUntil = 0, 0
+
+    local function submit()
+        local remaining = lockedUntil - os.clock()
+        if remaining > 0 then
+            status.Text = string.format("Too many tries. Wait %d s.", math.ceil(remaining))
+            return
+        end
+
+        local entered = (box.Text:gsub("%s", ""))  -- ignore stray spaces from copy/paste
+        if VALID_KEYS[entered] then
+            unlocked:Fire()
+        else
+            attempts += 1
+            box.Text = ""
+            if attempts >= KEY_MAX_ATTEMPTS then
+                attempts = 0
+                lockedUntil = os.clock() + KEY_LOCKOUT_SECONDS
+                status.Text = string.format("Too many tries. Wait %d s.", KEY_LOCKOUT_SECONDS)
+            else
+                status.Text = "Invalid key."
+            end
+        end
+    end
+
+    submitBtn.Activated:Connect(submit)
+    box.FocusLost:Connect(function(enterPressed)
+        if enterPressed then submit() end
+    end)
+
+    unlocked.Event:Wait()  -- the script pauses here until a valid key is entered
+    unlocked:Destroy()
+    gui:Destroy()
+end
+
+waitForKey()
+
+---------------------------------------------------------------------
 -- Settings: walk to ball (these are the defaults; the panel changes them live)
 ---------------------------------------------------------------------
 local TRIGGER_KEY = Enum.KeyCode.E
@@ -64,7 +181,8 @@ local SPAM_KEY = Enum.KeyCode.T -- Key to spam while walking
 local SPAM_INTERVAL = 0.1       -- Time in seconds between each spam press
 
 -- UI Toggle Hotkey Setting
-local UI_TOGGLE_KEY = Enum.KeyCode.F4 -- Press F4 to completely hide/show all your UI panels
+local UI_TOGGLE_KEY = Enum.KeyCode.F4 -- Press F4 to minimize / restore all your UI panels
+local MINIMIZE_TO_PILL = true -- true = leave a small "Show UI" tab when minimized; false = hide everything completely
 
 local PRESETS = {
     Color3.fromRGB(255, 70, 70),   -- red
@@ -91,9 +209,11 @@ local walkStop = STOP_DISTANCE
 local walkSide = "Right"          -- "Right", "Left" or "Any"
 local triggerKey = TRIGGER_KEY
 local listeningForKey = false     -- true while the panel is waiting for a new key
+local learnedGScale = 1          -- gravity multiplier learned from earlier balls (new balls start from it)
 local activeTripId = nil          -- id of the trip currently running (nil = none)
 local holding = false             -- true while the walk key / panel button is held down
 local holdSource = nil            -- "key" or "button"
+local toggleUi                    -- set by the panel; minimizes / restores every panel
 local mainGuiReference = nil      -- reference to the ScreenGui for hiding/showing
 local refreshKeyButton            -- set by the panel so the key button can update its label
 
@@ -172,7 +292,8 @@ local function addBall(inst)
         fitPos = nil,   -- last smoothed position / velocity / time
         fitVel = nil,
         fitTime = nil,
-        gScale = 1,     -- learned gravity multiplier for this ball
+        gScale = learnedGScale,  -- gravity multiplier for this ball (starts from what earlier balls taught us)
+        gSamples = 0,
         lastDebug = 0,
         dead = false,   -- landed: ignored for good (no marker, arc, or walking)
         marker = createMarker(),
@@ -473,12 +594,22 @@ local function updateMotion(data, part, baseGravity)
     -- learn how this ball really falls, and ease toward it
     if AUTO_GRAVITY and not GRAVITY_OVERRIDE and not data.dead and not bounced then
         local scale = fitGravityScale(history, -baseGravity.Y)
-        if scale and scale > 0.4 and scale < 1.6 then
-            data.gScale += (scale - data.gScale) * 0.1
+        if scale and scale > 0.1 and scale < 2.5 then
+            -- adapt quickly at first, then settle
+            local rate = data.gSamples < 4 and 0.5 or 0.15
+            data.gSamples += 1
+            data.gScale += (scale - data.gScale) * rate
             gravity = baseGravity * data.gScale
+
+            -- once settled, remember it so the NEXT ball starts out with the right gravity
+            if data.gSamples >= 8 then
+                learnedGScale = data.gScale
+            end
+
             if DEBUG and now - data.lastDebug > 0.5 then
                 data.lastDebug = now
-                print(string.format("[BallTracker] gravity scale %.2f (measured %.2f)", data.gScale, scale))
+                print(string.format("[BallTracker] gravity scale %.2f  (GRAVITY_OVERRIDE = %.1f would lock this in)",
+                    data.gScale, -baseGravity.Y * data.gScale))
             end
         end
     end
@@ -489,9 +620,20 @@ local function updateMotion(data, part, baseGravity)
         return fitPos, fitVel, bounced, gravity
     end
 
-    -- not enough samples yet: fall back to what the engine reports
+    -- not enough samples yet: use what the engine reports...
     data.fitPos = nil
-    return pos, part.AssemblyLinearVelocity, bounced, gravity
+    local vel = part.AssemblyLinearVelocity
+    local n = #history
+    if vel.Magnitude < 1 and n >= 2 then
+        -- ...unless it reports nothing while the ball is clearly moving (moved by a script, or not
+        -- replicated yet): then use the last two positions
+        local a, b = history[n - 1], history[n]
+        local dtSample = b.t - a.t
+        if dtSample > 0.005 and (b.pos - a.pos).Magnitude > 0.05 then
+            vel = (b.pos - a.pos) / dtSample + 0.5 * gravity * dtSample
+        end
+    end
+    return pos, vel, bounced, gravity
 end
 
 RunService.Heartbeat:Connect(function(dt)
@@ -725,9 +867,7 @@ end)
 UserInputService.InputBegan:Connect(function(input, processed)
     -- Global hotkey to hide / show the UI
     if input.KeyCode == UI_TOGGLE_KEY then
-        if mainGuiReference then
-            mainGuiReference.Enabled = not mainGuiReference.Enabled
-        end
+        if toggleUi then toggleUi() end
         return
     end
 
@@ -1066,6 +1206,33 @@ local function createPanel()
         else
             distBox.Text = tostring(TRIGGER_DISTANCE)
         end
+    end)
+
+    -- Minimize / restore: the hotkey collapses every panel; the small tab (or the hotkey again) brings them back
+    local pill = Instance.new("TextButton")
+    pill.Size = UDim2.new(0, 120, 0, 28)
+    pill.Position = UDim2.new(0, 20, 0, 60)
+    pill.BackgroundColor3 = Color3.fromRGB(30, 30, 34)
+    pill.BorderSizePixel = 0
+    pill.Text = "Show UI (" .. UI_TOGGLE_KEY.Name .. ")"
+    pill.TextColor3 = Color3.new(1, 1, 1)
+    pill.Font = Enum.Font.GothamBold
+    pill.TextSize = 12
+    pill.Visible = false
+    pill.Active = true
+    pill.Draggable = true
+    pill.Parent = gui
+    Instance.new("UICorner", pill).CornerRadius = UDim.new(0, 14)
+
+    local minimized = false
+    toggleUi = function()
+        minimized = not minimized
+        frame.Visible = not minimized
+        actionFrame.Visible = not minimized
+        pill.Visible = minimized and MINIMIZE_TO_PILL
+    end
+    pill.Activated:Connect(function()
+        if minimized then toggleUi() end
     end)
 end
 
