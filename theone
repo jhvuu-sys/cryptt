@@ -1,6 +1,6 @@
 --- Combined LocalScript
---- 1) Press E (or click Walk Now in the panel): find the ball whose predicted landing spot is nearest
----    on the chosen side (Right / Left / Any) of the character, and walk right onto it
+--- 1) HOLD E (or hold the panel's button): walk to the ball whose predicted landing spot is nearest
+---    on the chosen side (Right / Left / Any) of the character, and onto it. Let go and it stops.
 --- 2) Ball landing predictor: tracks every ball, marker + arc per ball, color panel, switches
 ---    (the walker reads the predictor's landing spots, so both share the same ball list)
 
@@ -21,25 +21,29 @@ local DETECT_RANGE = 40        -- how far away a ball's landing spot can be (stu
 local SIDE_THRESHOLD = 0.5     -- for Right / Left: 1 = exactly to the side, 0.5 = within ~60 degrees of it
 local STOP_DISTANCE = 1        -- how close counts as "on top of it" (studs); 0 = keep going until timeout
 local GIVE_UP_TIME = 8         -- stop trying after this many seconds
+local HOLD_TO_WALK = true      -- true = acts only while the key is held; false = one tap starts a trip
 
 ---------------------------------------------------------------------
 -- Settings: ball landing predictor & Action triggers
 ---------------------------------------------------------------------
-local BALL_NAME = "Ball"         -- every Part or Model with this name is tracked AND is what E walks to
-local MAX_BALLS = 10             -- safety cap on how many balls are tracked at once
+local BALL_NAME = "Ball"          -- every Part or Model with this name is tracked AND is what E walks to
+local MAX_BALLS = 10              -- safety cap on how many balls are tracked at once
 local STEP = 1 / 30               -- simulation step (seconds)
-local MAX_TIME = 6               -- how far ahead to predict (seconds)
+local MAX_TIME = 6                -- how far ahead to predict (seconds)
 
 local IGNORE_INVISIBLE = true     -- skip parts that are (nearly) transparent
 local INVISIBLE_THRESHOLD = 0.95  -- Transparency at or above this counts as invisible
 
 local SAMPLE_WINDOW = 0.25        -- seconds of recent movement used to smooth the ball's position/velocity
 local MIN_SAMPLES = 4             -- need at least this many samples before trusting the smoothing
-local RESET_ERROR = 2             -- studs off the predicted arc before old samples are thrown out (bounce, hit, teleport)
+local RESET_ERROR = 0.75          -- studs off the predicted arc before old samples are thrown out (launch, bounce, hit)
+local RECENCY_HALF_LIFE = 0.1     -- newer samples count more; every this many seconds an older sample counts half as much
+local AUTO_GRAVITY = true         -- learn how this ball really falls (custom gravity / lift) from its own flight
+local DEBUG = false               -- true = print the learned gravity scale (1 = normal Roblox gravity)
 local SMOOTHING = 12              -- landing marker smoothing (higher = snappier, lower = steadier)
 local SNAP_DISTANCE = 8           -- landing jumps bigger than this snap instead of gliding
 local USE_SPHERECAST = true       -- account for the ball's size instead of tracing only its center
-local GRAVITY_OVERRIDE = nil      -- set a number if your ball falls differently from Workspace.Gravity
+local GRAVITY_OVERRIDE = nil      -- set a number to force the ball's gravity (turns AUTO_GRAVITY off)
 
 local DEAD_DISTANCE = 6          -- ball bounced within this many studs of its predicted landing spot = it landed
 local LAND_TOUCH = 1              -- or it got this close (beyond its own radius) to the landing spot
@@ -87,8 +91,11 @@ local walkStop = STOP_DISTANCE
 local walkSide = "Right"          -- "Right", "Left" or "Any"
 local triggerKey = TRIGGER_KEY
 local listeningForKey = false     -- true while the panel is waiting for a new key
-local refreshKeyButton            -- set by the panel so the key button can update its label
+local activeTripId = nil          -- id of the trip currently running (nil = none)
+local holding = false             -- true while the walk key / panel button is held down
+local holdSource = nil            -- "key" or "button"
 local mainGuiReference = nil      -- reference to the ScreenGui for hiding/showing
+local refreshKeyButton            -- set by the panel so the key button can update its label
 
 ---------------------------------------------------------------------
 -- Character binding (single handler for the whole script)
@@ -165,6 +172,8 @@ local function addBall(inst)
         fitPos = nil,   -- last smoothed position / velocity / time
         fitVel = nil,
         fitTime = nil,
+        gScale = 1,     -- learned gravity multiplier for this ball
+        lastDebug = 0,
         dead = false,   -- landed: ignored for good (no marker, arc, or walking)
         marker = createMarker(),
         highlight = createHighlight(),
@@ -184,6 +193,7 @@ local function removeBall(inst)
     ballCount -= 1
 end
 
+-- Resolves the BasePart to read position/velocity from (handles Models)
 local function getPart(data)
     local part = data.part
     if part and part.Parent then return part end
@@ -198,6 +208,7 @@ local function getPart(data)
     return part
 end
 
+-- Pick up balls that already exist, then watch for new/removed ones
 for _, d in ipairs(Workspace:GetDescendants()) do
     addBall(d)
 end
@@ -281,18 +292,19 @@ local function setMarkerColor(color)
         data.marker.Color = color
         data.highlight.FillColor = color
     end
+    -- arc segments pick up the new color on the next draw
 end
 
 ---------------------------------------------------------------------
 -- Predictor: prediction
 ---------------------------------------------------------------------
-local skipped = setmetatable({}, { __mode = "k" })
-local rayParams
+local skipped = setmetatable({}, { __mode = "k" })  -- invisible parts we've learned to ignore
+local rayParams                                      -- shared by all balls, rebuilt each frame
 
 local function buildRayParams()
     local ignore = { markerFolder, arcFolder, highlightFolder }
     for inst in pairs(balls) do
-        table.insert(ignore, inst)
+        table.insert(ignore, inst)  -- every tracked ball ignores every other ball
     end
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr.Character then table.insert(ignore, plr.Character) end
@@ -304,21 +316,24 @@ local function buildRayParams()
     local p = RaycastParams.new()
     p.FilterType = Enum.RaycastFilterType.Exclude
     p.FilterDescendantsInstances = ignore
-    p.RespectCanCollide = true
+    p.RespectCanCollide = true  -- ignores parts with CanCollide = false
     return p
 end
 
+-- Radius of the ball (used so the arc ends when the ball's SURFACE touches, not its center)
 local function getRadius(data, part)
     if not USE_SPHERECAST then return 0 end
     local size = data.inst:IsA("Model") and data.inst:GetExtentsSize() or part.Size
     return math.min(size.X, size.Y, size.Z) / 2
 end
 
+-- Casts one segment, skipping invisible parts and re-casting past them
 local function castSegment(from, to, radius)
     local dir = to - from
     for _ = 1, 6 do
         local hit
         if radius > 0.05 then
+            -- slightly smaller than the ball so a ball resting on the ground doesn't start "inside" it
             hit = Workspace:Spherecast(from, radius * 0.95, dir, rayParams)
         else
             hit = Workspace:Raycast(from, dir, rayParams)
@@ -336,6 +351,7 @@ local function castSegment(from, to, radius)
     return nil
 end
 
+-- Returns the landing position (or nil) and every point along the path
 local function predictLanding(pos, vel, radius, gravity)
     local points = { pos }
     local t = 0
@@ -346,6 +362,7 @@ local function predictLanding(pos, vel, radius, gravity)
 
         local hit = castSegment(pos, newPos, radius)
         if hit then
+            -- the arc ends where the ball's center is at impact; the marker goes on the surface it hits
             table.insert(points, pos + move.Unit * hit.Distance)
             return hit.Position, points
         end
@@ -359,7 +376,11 @@ end
 
 ---------------------------------------------------------------------
 -- Predictor: motion tracking
+-- Reading one frame of position/velocity is noisy (network updates arrive in steps), which
+-- makes the arc jitter. Instead, fit the last fraction of a second of positions to a gravity arc.
 ---------------------------------------------------------------------
+-- Returns the smoothed position and velocity at the latest sample, or nil if there isn't enough data.
+-- Recent samples count more than old ones, so a launch or a change of direction shows up quickly.
 local function fitMotion(history, gravity)
     local n = #history
     if n < MIN_SAMPLES then return nil end
@@ -367,31 +388,72 @@ local function fitMotion(history, gravity)
     local tLast = history[n].t
     if tLast - history[1].t < 0.06 then return nil end
 
-    local sT, sTT = 0, 0
+    -- remove gravity's effect, then fit a straight line:  pos - 0.5*g*tau^2 = pos0 + vel*tau
+    local k = math.log(2) / RECENCY_HALF_LIFE
+    local sW, sT, sTT = 0, 0, 0
     local sY, sTY = Vector3.zero, Vector3.zero
     for _, s in ipairs(history) do
         local tau = s.t - tLast
+        local w = math.exp(tau * k)
         local y = s.pos - 0.5 * gravity * tau * tau
-        sT += tau
-        sTT += tau * tau
-        sY += y
-        sTY += y * tau
+        sW += w
+        sT += w * tau
+        sTT += w * tau * tau
+        sY += y * w
+        sTY += y * (w * tau)
     end
 
-    local denom = n * sTT - sT * sT
-    if denom < 1e-9 then return nil end
+    local denom = sW * sTT - sT * sT
+    if denom < 1e-12 then return nil end
 
-    local vel = (sTY * n - sY * sT) / denom
-    local pos = (sY - vel * sT) / n
+    local vel = (sTY * sW - sY * sT) / denom
+    local pos = (sY - vel * sT) / sW
     return pos, vel
 end
 
-local function updateMotion(data, part, gravity)
+-- Fits the height samples to a parabola and returns how strongly the ball really falls,
+-- as a multiple of normal gravity (nil if there isn't enough clean data)
+local function fitGravityScale(history, baseG)
+    local n = #history
+    if n < 6 then return nil end
+
+    local tLast = history[n].t
+    if tLast - history[1].t < 0.18 then return nil end
+
+    local s1, s2, s3, s4 = 0, 0, 0, 0
+    local sy, sty, stty = 0, 0, 0
+    for _, s in ipairs(history) do
+        local tau = s.t - tLast
+        local t2 = tau * tau
+        local y = s.pos.Y
+        s1 += tau
+        s2 += t2
+        s3 += t2 * tau
+        s4 += t2 * t2
+        sy += y
+        sty += tau * y
+        stty += t2 * y
+    end
+
+    -- solve  [n s1 s2; s1 s2 s3; s2 s3 s4] * [c0 c1 c2] = [sy sty stty]  for c2 (Cramer's rule)
+    local det = n * (s2 * s4 - s3 * s3) - s1 * (s1 * s4 - s3 * s2) + s2 * (s1 * s3 - s2 * s2)
+    if math.abs(det) < 1e-9 then return nil end
+    local det3 = n * (s2 * stty - sty * s3) - s1 * (s1 * stty - sty * s2) + sy * (s1 * s3 - s2 * s2)
+    local c2 = det3 / det
+
+    return (-2 * c2) / baseG  -- height = c0 + c1*t + c2*t^2, so downward acceleration = -2*c2
+end
+
+-- Returns the smoothed position, velocity, whether the ball just left its arc (launch, bounce, hit),
+-- and the gravity to use for this ball
+local function updateMotion(data, part, baseGravity)
     local now = os.clock()
     local history = data.history
     local pos = part.Position
     local bounced = false
+    local gravity = baseGravity * data.gScale
 
+    -- A sudden jump away from the fitted arc means the old samples are stale
     if data.fitPos then
         local tau = now - data.fitTime
         local expected = data.fitPos + data.fitVel * tau + 0.5 * gravity * tau * tau
@@ -408,18 +470,32 @@ local function updateMotion(data, part, gravity)
         table.remove(history, 1)
     end
 
+    -- learn how this ball really falls, and ease toward it
+    if AUTO_GRAVITY and not GRAVITY_OVERRIDE and not data.dead and not bounced then
+        local scale = fitGravityScale(history, -baseGravity.Y)
+        if scale and scale > 0.4 and scale < 1.6 then
+            data.gScale += (scale - data.gScale) * 0.1
+            gravity = baseGravity * data.gScale
+            if DEBUG and now - data.lastDebug > 0.5 then
+                data.lastDebug = now
+                print(string.format("[BallTracker] gravity scale %.2f (measured %.2f)", data.gScale, scale))
+            end
+        end
+    end
+
     local fitPos, fitVel = fitMotion(history, gravity)
     if fitPos then
         data.fitPos, data.fitVel, data.fitTime = fitPos, fitVel, now
-        return fitPos, fitVel, bounced
+        return fitPos, fitVel, bounced, gravity
     end
 
+    -- not enough samples yet: fall back to what the engine reports
     data.fitPos = nil
-    return pos, part.AssemblyLinearVelocity, bounced
+    return pos, part.AssemblyLinearVelocity, bounced, gravity
 end
 
 RunService.Heartbeat:Connect(function(dt)
-    rayParams = buildRayParams()
+    rayParams = buildRayParams()  -- once per frame, shared by every ball
     local gravity = Vector3.new(0, -(GRAVITY_OVERRIDE or Workspace.Gravity), 0)
 
     for inst, data in pairs(balls) do
@@ -430,25 +506,27 @@ RunService.Heartbeat:Connect(function(dt)
             data.fitPos = nil
             hideBall(data)
         else
-            local pos, vel, bounced = updateMotion(data, part, gravity)
+            local pos, vel, bounced, g = updateMotion(data, part, gravity)
             local radius = getRadius(data, part)
 
             if not data.dead then
+                -- Did it just land? (reached the predicted spot, or bounced right next to it)
                 local last = data.landing
                 if last then
                     local away = (pos - last).Magnitude
                     if away < radius + LAND_TOUCH or (bounced and away < DEAD_DISTANCE) then
-                        data.dead = true
+                        data.dead = true  -- permanent: the bounce is ignored from here on
                     end
                 end
             end
 
             if data.dead then
-                hideBall(data)
+                hideBall(data)  -- no marker, no arc, nothing to walk to
             else
-                local landing, points = predictLanding(pos, vel, radius, gravity)
+                local landing, points = predictLanding(pos, vel, radius, g)
 
                 if landing then
+                    -- glide the landing spot toward each new estimate so it doesn't twitch
                     local prev = data.landing
                     if prev and (landing - prev).Magnitude < SNAP_DISTANCE then
                         landing = prev:Lerp(landing, 1 - math.exp(-SMOOTHING * dt))
@@ -458,6 +536,7 @@ RunService.Heartbeat:Connect(function(dt)
                     data.landing = nil
                 end
 
+                -- the panel switches only control what is drawn; tracking (and walking) keeps running
                 if enabled and landing then
                     data.marker.Transparency = 0.35
                     data.marker.CFrame = CFrame.new(landing + Vector3.new(0, 0.1, 0))
@@ -483,8 +562,10 @@ RunService.Heartbeat:Connect(function(dt)
 end)
 
 ---------------------------------------------------------------------
--- Walk to ball & Action Trigger (Rotation, Key 3, & Spam Sprint)
+-- Walk to ball (goes right onto its predicted landing spot)
 ---------------------------------------------------------------------
+-- Where we want to stand: the predicted landing spot if there is one,
+-- otherwise the ball itself (no prediction yet). Dead (landed) balls are ignored.
 local function getGoal(data)
     if data.dead then return nil end
     local part = getPart(data)
@@ -492,20 +573,19 @@ local function getGoal(data)
     return data.landing or part.Position
 end
 
-local function findBall()
+-- Returns the tracked ball whose goal point is closest and on the chosen side
+local function findBall(skip)
+    if not root then return nil end
     local best, bestDist = nil, math.huge
-    local myRoot = root
-    if not myRoot then return nil end
-
     for _, data in pairs(balls) do
         local goal = getGoal(data)
-        if goal then
-            local offset = goal - myRoot.Position
-            offset = Vector3.new(offset.X, 0, offset.Z)
+        if goal and not (skip and skip[data]) then
+            local offset = goal - root.Position
+            offset = Vector3.new(offset.X, 0, offset.Z)  -- ignore height
             local dist = offset.Magnitude
 
             if dist > 0.1 and dist <= walkRange and dist < bestDist then
-                local side = offset.Unit:Dot(myRoot.CFrame.RightVector)
+                local side = offset.Unit:Dot(root.CFrame.RightVector)  -- +1 = right, -1 = left
                 local ok = walkSide == "Any"
                     or (walkSide == "Right" and side >= SIDE_THRESHOLD)
                     or (walkSide == "Left" and -side >= SIDE_THRESHOLD)
@@ -521,10 +601,11 @@ end
 local function stopMoving()
     runId += 1
     if humanoid and root then
-        humanoid:MoveTo(root.Position)
+        humanoid:MoveTo(root.Position)  -- moving to where we already are cancels the walk
     end
 end
 
+-- Presses a key through VirtualInputManager (held briefly so the game registers it)
 local function simulateKeyPress(keyCode)
     VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
     task.wait(0.05)
@@ -534,22 +615,28 @@ end
 local function walkTo(data)
     runId += 1
     local myId = runId
+    activeTripId = myId
     local startTime = os.clock()
     local lastCommand = 0
     local lastSpamTime = 0
-    local lastGoal
+    local lastGoal  -- if the ball lands mid-trip, keep going to where it landed
     local actionFired = false
 
     local conn
-    conn = RunService.Heartbeat:Connect(function(dt)
+    local function finish()
+        conn:Disconnect()
+        if activeTripId == myId then activeTripId = nil end
+    end
+    conn = RunService.Heartbeat:Connect(function()
+        -- Cancelled, died, or the ball was removed
         if runId ~= myId or not humanoid or humanoid.Health <= 0 or not root or balls[data.inst] ~= data then
-            conn:Disconnect()
+            finish()
             return
         end
 
         local goal = getGoal(data) or lastGoal
         if not goal then
-            conn:Disconnect()
+            finish()
             return
         end
         lastGoal = goal
@@ -567,28 +654,28 @@ local function walkTo(data)
             end)
         end
 
-        -- Trigger condition: rotate character to look at target and send key "3" when close enough
+        -- Close enough: face the target and press the action key
         if flatDist <= TRIGGER_DISTANCE and not actionFired then
             if FIRE_ONCE_PER_TRIP then
                 actionFired = true
             end
 
-            -- Snap orientation horizontally (Yaw only) toward the target goal/marker
+            -- Snap orientation horizontally (yaw only) toward the target
             local lookTarget = Vector3.new(goal.X, root.Position.Y, goal.Z)
             root.CFrame = CFrame.lookAt(root.Position, lookTarget)
 
-            -- Send virtual input press for Key "3"
-            simulateKeyPress(ACTION_KEY)
+            task.spawn(simulateKeyPress, ACTION_KEY)  -- spawned so the key hold doesn't pause this loop
         end
 
         -- Arrived, or took too long
         if flatDist <= walkStop or os.clock() - startTime > GIVE_UP_TIME then
-            conn:Disconnect()
+            finish()
             humanoid:MoveTo(root.Position)
             return
         end
 
-        -- MoveTo re-issued periodically to handle moving landing predictions
+        -- MoveTo expires after ~8 s and the goal keeps changing as the prediction updates,
+        -- so re-issue it a few times per second
         if os.clock() - lastCommand > 0.25 then
             lastCommand = os.clock()
             humanoid:MoveTo(goal)
@@ -596,18 +683,47 @@ local function walkTo(data)
     end)
 end
 
-local function startWalk()
-    if not walkEnabled then return end
+-- Hold-to-walk: while the key (or the panel button) is held, keep walking to the nearest ball;
+-- the moment it is released, stop.
+local holdVisited = {}  -- balls already walked to during this hold, so we don't keep re-walking to one
+
+local function beginHold(source)
+    if holding or not walkEnabled then return end
     if not (humanoid and root) or humanoid.Health <= 0 then return end
 
-    local data = findBall()
-    if data then
-        walkTo(data)
+    if not HOLD_TO_WALK then  -- tap mode: one trip per press
+        local data = findBall()
+        if data then walkTo(data) end
+        return
     end
+
+    holding = true
+    holdSource = source
+    table.clear(holdVisited)
 end
 
+local function endHold()
+    if not holding then return end
+    holding = false
+    holdSource = nil
+    stopMoving()  -- cancels the trip and halts the character
+end
+
+-- While held and not already walking, pick the next ball in range
+RunService.Heartbeat:Connect(function()
+    if not holding or activeTripId then return end
+    if not walkEnabled or not (humanoid and root) or humanoid.Health <= 0 then return end
+
+    local data = findBall(holdVisited)
+    if data then
+        holdVisited[data] = true
+        walkTo(data)
+    end
+end)
+
+-- `processed` is true while typing in the hex box, so pressing the key there will not start anything.
 UserInputService.InputBegan:Connect(function(input, processed)
-    -- Global Hotkey to Toggle UI Visibility
+    -- Global hotkey to hide / show the UI
     if input.KeyCode == UI_TOGGLE_KEY then
         if mainGuiReference then
             mainGuiReference.Enabled = not mainGuiReference.Enabled
@@ -615,10 +731,10 @@ UserInputService.InputBegan:Connect(function(input, processed)
         return
     end
 
-    if listeningForKey then
+    if listeningForKey then  -- the panel's Key button is waiting for a new key
         if input.UserInputType == Enum.UserInputType.Keyboard then
             listeningForKey = false
-            if input.KeyCode ~= Enum.KeyCode.Escape then
+            if input.KeyCode ~= Enum.KeyCode.Escape then  -- Escape cancels
                 triggerKey = input.KeyCode
             end
             if refreshKeyButton then refreshKeyButton() end
@@ -627,11 +743,22 @@ UserInputService.InputBegan:Connect(function(input, processed)
     end
 
     if processed or input.KeyCode ~= triggerKey then return end
-    startWalk()
+    beginHold("key")
+end)
+
+-- Letting go of the key (or the panel button) stops everything right away
+UserInputService.InputEnded:Connect(function(input)
+    if not holding then return end
+    if holdSource == "key" and input.KeyCode == triggerKey then
+        endHold()
+    elseif holdSource == "button" and (input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch) then
+        endHold()
+    end
 end)
 
 ---------------------------------------------------------------------
--- Predictor & Action Settings Panels
+-- Predictor: settings panel
 ---------------------------------------------------------------------
 local function styleToggle(btn, on)
     btn.Text = on and "ON" or "OFF"
@@ -644,24 +771,23 @@ local function createPanel()
     local gui = Instance.new("ScreenGui")
     gui.Name = "MarkerColorPanel"
     gui.ResetOnSpawn = false
-    
+
     local success = pcall(function()
         gui.Parent = CoreGui
     end)
     if not success then
         gui.Parent = player:WaitForChild("PlayerGui")
     end
-    
-    mainGuiReference = gui -- Store reference to toggle UI visibility
 
-    -- 1) Main Predictor Panel
+    mainGuiReference = gui  -- so the hotkey can hide / show the panels
+
     local frame = Instance.new("Frame")
     frame.Size = UDim2.new(0, 230, 0, 388)
     frame.Position = UDim2.new(0, 20, 0.5, -194)
     frame.BackgroundColor3 = Color3.fromRGB(30, 30, 34)
     frame.BorderSizePixel = 0
     frame.Active = true
-    frame.Draggable = true
+    frame.Draggable = true  -- deprecated but still works; drag the panel anywhere
     frame.Parent = gui
     Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
 
@@ -740,7 +866,7 @@ local function createPanel()
                 tonumber(hex:sub(5, 6), 16)
             ))
         else
-            hexBox.Text = ""
+            hexBox.Text = ""  -- invalid input, keep the current color
         end
     end)
 
@@ -773,6 +899,9 @@ local function createPanel()
         end
     end)
 
+    -----------------------------------------------------------------
+    -- Walking section
+    -----------------------------------------------------------------
     local divider = Instance.new("Frame")
     divider.Size = UDim2.new(1, -20, 0, 1)
     divider.Position = UDim2.new(0, 10, 0, 172)
@@ -809,6 +938,7 @@ local function createPanel()
         return btn
     end
 
+    -- "-  value  +" control
     local function makeStepper(y, get, set, step, min, max)
         local minus = makeButton("-", 110, y, 24, 24)
         local plus = makeButton("+", 186, y, 24, 24)
@@ -847,7 +977,7 @@ local function createPanel()
     walkToggleBtn.Activated:Connect(function()
         walkEnabled = not walkEnabled
         styleToggle(walkToggleBtn, walkEnabled)
-        if not walkEnabled then stopMoving() end
+        if not walkEnabled then endHold(); stopMoving() end  -- cancel anything in progress
     end)
 
     makeLabel("Side", 218)
@@ -875,9 +1005,15 @@ local function createPanel()
 
     local walkNowBtn = makeButton("Walk Now", 10, 348, 210, 28)
     walkNowBtn.BackgroundColor3 = Color3.fromRGB(60, 110, 200)
-    walkNowBtn.Activated:Connect(startWalk)
+    walkNowBtn.Text = HOLD_TO_WALK and "Hold to Walk" or "Walk Now"
+    walkNowBtn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            beginHold("button")  -- released via the global InputEnded handler above
+        end
+    end)
 
-    -- 2) Secondary Action Config Panel (Trigger Distance for Key 3)
+    -- Second panel: action config (trigger distance for the action key)
     local actionFrame = Instance.new("Frame")
     actionFrame.Size = UDim2.new(0, 230, 0, 80)
     actionFrame.Position = UDim2.new(0, 260, 0.5, -194)
@@ -924,7 +1060,7 @@ local function createPanel()
     Instance.new("UICorner", distBox).CornerRadius = UDim.new(0, 5)
 
     distBox.FocusLost:Connect(function()
-        val, num = nil, tonumber(distBox.Text)
+        local num = tonumber(distBox.Text)
         if num then
             TRIGGER_DISTANCE = num
         else
