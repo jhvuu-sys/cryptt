@@ -1,0 +1,19 @@
+local VirtualInputManager = game:GetService("VirtualInputManager")
+
+local function simulatePhysicalThreeKey()
+    print("[VIM] Injecting engine-level '3' keypress...")
+    
+    -- Parameters: (isPressed, keyCode, gameProcessedEvent, customDataModel)
+    -- 1. Send Key Down
+    VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Three, false, game)
+    
+    -- 2. Brief delay to simulate a natural physical key hold duration
+    task.wait(0.05) 
+    
+    -- 3. Send Key Up
+    VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Three, false, game)
+end
+
+-- Example trigger: Run this whenever you want to trigger the spin
+task.wait(1)
+simulatePhysicalThreeKey()
