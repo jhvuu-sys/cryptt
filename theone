@@ -841,3 +841,139 @@ local function createPanel()
 end
 
 createPanel()
+-- ============================================================================
+-- LUI WALK FUNCTION   VIRTUAL INPUT FOR DIVE AND SPRINT
+-- ============================================================================
+
+---------------------------------------------------------------------
+-- Virtual Input & Auto-Action Configuration
+---------------------------------------------------------------------
+local VirtualInputManager = game:GetService("VirtualInputManager")
+
+-- Configuration variables for the virtual key actions
+local ACTION_KEY = Enum.KeyCode.Three
+local TRIGGER_DISTANCE = 5      -- Distance (studs) from landing spot to fire the "3" input
+local FIRE_ONCE_PER_TRIP = true -- Prevents spamming "3" repeatedly on the same run
+
+-- Continuous spam configuration during the walk phase
+local SPAM_KEY = Enum.KeyCode.T
+local SPAM_INTERVAL = 0.05       -- Time (seconds) between each "T" keypress event
+
+---------------------------------------------------------------------
+-- Automated Ball Hunter Core Logic (With Dynamic Multiple Key Injection)
+---------------------------------------------------------------------
+local function triggerAutomatedBallWalk()
+    if not walkEnabled or not root or not humanoid then return end
+
+    local charPos = root.Position
+    local bestBallData = nil
+    local bestDistance = walkRange
+
+    -- Find the closest valid ball matching your panel settings
+    for inst, data in pairs(balls) do
+        if not data.dead and data.landing then
+            local part = getPart(data)
+            if part then
+                local isTransparent = part:IsA("BasePart") and part.Transparency >= INVISIBLE_THRESHOLD
+                if not (IGNORE_INVISIBLE and isTransparent) then
+                    
+                    local landPos = data.landing
+                    local distance = (landPos - charPos).Magnitude
+
+                    if distance <= bestDistance then
+                        -- Directional panel check (Right/Left/Any)
+                        local toLanding = (landPos - charPos).Unit
+                        local lookVector = root.CFrame.LookVector
+                        local rightVector = root.CFrame.RightVector
+                        
+                        local forwardDot = lookVector:Dot(toLanding)
+                        local rightDot = rightVector:Dot(toLanding)
+
+                        local sideMatches = false
+                        if walkSide == "Any" then
+                            sideMatches = true
+                        elseif walkSide == "Right" and rightDot >= SIDE_THRESHOLD and forwardDot >= -0.2 then
+                            sideMatches = true
+                        elseif walkSide == "Left" and rightDot <= -SIDE_THRESHOLD and forwardDot >= -0.2 then
+                            sideMatches = true
+                        end
+
+                        if sideMatches then
+                            bestDistance = distance
+                            bestBallData = data
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- Execute walking path and dual key injection sequences
+    if bestBallData then
+        runId += 1
+        local currentRunId = runId
+        local hasFiredInput3 = false -- Track fire state for the "3" key trip
+        local lastSpamTime = 0       -- Track cadence for the "T" key spam
+        
+        task.spawn(function()
+            local startTime = os.clock()
+            local targetLandPos = bestBallData.landing
+            
+            while runId == currentRunId and bestBallData.inst.Parent and not bestBallData.dead do
+                local currentPos = root.Position
+                local currentLandPos = bestBallData.landing or targetLandPos
+                local remDist = (currentLandPos - currentPos).Magnitude
+
+                -- 1) CONTINUOUS ACTION: Fire the "T" key multiple times while walking
+                local currentTime = os.clock()
+                if (currentTime - lastSpamTime) >= SPAM_INTERVAL then
+                    lastSpamTime = currentTime
+                    task.spawn(function()
+                        VirtualInputManager:SendKeyEvent(true, SPAM_KEY, false, game)
+                        task.wait(0.02)
+                        VirtualInputManager:SendKeyEvent(false, SPAM_KEY, false, game)
+                    end)
+                end
+
+                -- 2) PROXIMITY ACTION: Check distance threshold to inject the virtual "3" key
+                if remDist <= TRIGGER_DISTANCE then
+                    if not FIRE_ONCE_PER_TRIP or not hasFiredInput3 then
+                        hasFiredInput3 = true
+                        
+                        task.spawn(function()
+                            VirtualInputManager:SendKeyEvent(true, ACTION_KEY, false, game)
+                            task.wait(0.05)
+                            VirtualInputManager:SendKeyEvent(false, ACTION_KEY, false, game)
+                        end)
+                    end
+                end
+
+                -- Stopping conditions
+                if remDist <= walkStop then break end
+                if (os.clock() - startTime) > GIVE_UP_TIME then break end
+
+                -- Force step movement directly towards target coordinate
+                humanoid:MoveTo(currentLandPos)
+                RunService.Heartbeat:Wait()
+            end
+            
+            -- Stop moving character cleanly if the trip ends or updates
+            if runId == currentRunId then
+                humanoid:MoveTo(root.Position)
+            end
+        end)
+    end
+end
+
+---------------------------------------------------------------------
+-- Hardware Trigger Hooks
+---------------------------------------------------------------------
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed or listeningForKey then return end
+    if input.KeyCode == triggerKey then
+        triggerAutomatedBallWalk()
+    end
+end)
+
+-- Store a global reference hook so other scripts or panels can invoke it instantly
+_G.ForceBallWalkTrigger = triggerAutomatedBallWalk
