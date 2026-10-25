@@ -49,10 +49,18 @@ local ARC_THICKNESS = 0.25
 local ARC_TRANSPARENCY = 0.35
 local ARC_DASHED = true           -- true = dashed line, false = solid
 
--- Virtual Action Settings (Key "3" & Rotation Snap)
+-- Virtual Action Settings (Key "3", Rotation Snap, & Continuous Sprint/Key Spam)
 local ACTION_KEY = Enum.KeyCode.Three
 local TRIGGER_DISTANCE = 5      -- Distance (studs) from target to snap-look and press "3"
 local FIRE_ONCE_PER_TRIP = true -- Prevents spamming "3" repeatedly on the same run
+
+-- Continuous Spam / Sprint Settings during the walk phase
+local SPAM_ENABLED = true       -- Set to false if you only want the single "3" key press
+local SPAM_KEY = Enum.KeyCode.T -- Key to spam while walking
+local SPAM_INTERVAL = 0.1       -- Time in seconds between each spam press
+
+-- UI Toggle Hotkey Setting
+local UI_TOGGLE_KEY = Enum.KeyCode.F4 -- Press F4 to completely hide/show all your UI panels
 
 local PRESETS = {
     Color3.fromRGB(255, 70, 70),   -- red
@@ -80,6 +88,7 @@ local walkSide = "Right"          -- "Right", "Left" or "Any"
 local triggerKey = TRIGGER_KEY
 local listeningForKey = false     -- true while the panel is waiting for a new key
 local refreshKeyButton            -- set by the panel so the key button can update its label
+local mainGuiReference = nil      -- reference to the ScreenGui for hiding/showing
 
 ---------------------------------------------------------------------
 -- Character binding (single handler for the whole script)
@@ -175,7 +184,6 @@ local function removeBall(inst)
     ballCount -= 1
 end
 
--- Resolves the BasePart to read position/velocity from (handles Models)
 local function getPart(data)
     local part = data.part
     if part and part.Parent then return part end
@@ -190,7 +198,6 @@ local function getPart(data)
     return part
 end
 
--- Pick up balls that already exist, then watch for new/removed ones
 for _, d in ipairs(Workspace:GetDescendants()) do
     addBall(d)
 end
@@ -274,19 +281,18 @@ local function setMarkerColor(color)
         data.marker.Color = color
         data.highlight.FillColor = color
     end
-    -- arc segments pick up the new color on the next draw
 end
 
 ---------------------------------------------------------------------
 -- Predictor: prediction
 ---------------------------------------------------------------------
-local skipped = setmetatable({}, { __mode = "k" })  -- invisible parts we've learned to ignore
-local rayParams                                    -- shared by all balls, rebuilt each frame
+local skipped = setmetatable({}, { __mode = "k" })
+local rayParams
 
 local function buildRayParams()
     local ignore = { markerFolder, arcFolder, highlightFolder }
     for inst in pairs(balls) do
-        table.insert(ignore, inst)  -- every tracked ball ignores every other ball
+        table.insert(ignore, inst)
     end
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr.Character then table.insert(ignore, plr.Character) end
@@ -298,24 +304,21 @@ local function buildRayParams()
     local p = RaycastParams.new()
     p.FilterType = Enum.RaycastFilterType.Exclude
     p.FilterDescendantsInstances = ignore
-    p.RespectCanCollide = true  -- ignores parts with CanCollide = false
+    p.RespectCanCollide = true
     return p
 end
 
--- Radius of the ball (used so the arc ends when the ball's SURFACE touches, not its center)
 local function getRadius(data, part)
     if not USE_SPHERECAST then return 0 end
     local size = data.inst:IsA("Model") and data.inst:GetExtentsSize() or part.Size
     return math.min(size.X, size.Y, size.Z) / 2
 end
 
--- Casts one segment, skipping invisible parts and re-casting past them
 local function castSegment(from, to, radius)
     local dir = to - from
     for _ = 1, 6 do
         local hit
         if radius > 0.05 then
-            -- slightly smaller than the ball so a ball resting on the ground doesn't start "inside" it
             hit = Workspace:Spherecast(from, radius * 0.95, dir, rayParams)
         else
             hit = Workspace:Raycast(from, dir, rayParams)
@@ -333,7 +336,6 @@ local function castSegment(from, to, radius)
     return nil
 end
 
--- Returns the landing position (or nil) and every point along the path
 local function predictLanding(pos, vel, radius, gravity)
     local points = { pos }
     local t = 0
@@ -344,7 +346,6 @@ local function predictLanding(pos, vel, radius, gravity)
 
         local hit = castSegment(pos, newPos, radius)
         if hit then
-            -- the arc ends where the ball's center is at impact; the marker goes on the surface it hits
             table.insert(points, pos + move.Unit * hit.Distance)
             return hit.Position, points
         end
@@ -366,7 +367,6 @@ local function fitMotion(history, gravity)
     local tLast = history[n].t
     if tLast - history[1].t < 0.06 then return nil end
 
-    -- remove gravity's effect, then fit a straight line:  pos - 0.5*g*tau^2 = pos0 + vel*tau
     local sT, sTT = 0, 0
     local sY, sTY = Vector3.zero, Vector3.zero
     for _, s in ipairs(history) do
@@ -392,7 +392,6 @@ local function updateMotion(data, part, gravity)
     local pos = part.Position
     local bounced = false
 
-    -- A sudden jump away from the fitted arc means the old samples are stale
     if data.fitPos then
         local tau = now - data.fitTime
         local expected = data.fitPos + data.fitVel * tau + 0.5 * gravity * tau * tau
@@ -420,7 +419,7 @@ local function updateMotion(data, part, gravity)
 end
 
 RunService.Heartbeat:Connect(function(dt)
-    rayParams = buildRayParams()  -- once per frame, shared by every ball
+    rayParams = buildRayParams()
     local gravity = Vector3.new(0, -(GRAVITY_OVERRIDE or Workspace.Gravity), 0)
 
     for inst, data in pairs(balls) do
@@ -439,13 +438,13 @@ RunService.Heartbeat:Connect(function(dt)
                 if last then
                     local away = (pos - last).Magnitude
                     if away < radius + LAND_TOUCH or (bounced and away < DEAD_DISTANCE) then
-                        data.dead = true  -- permanent: the bounce is ignored from here on
+                        data.dead = true
                     end
                 end
             end
 
             if data.dead then
-                hideBall(data)  -- no marker, no arc, nothing to walk to
+                hideBall(data)
             else
                 local landing, points = predictLanding(pos, vel, radius, gravity)
 
@@ -484,7 +483,7 @@ RunService.Heartbeat:Connect(function(dt)
 end)
 
 ---------------------------------------------------------------------
--- Walk to ball & Action Trigger (Rotation + Key 3)
+-- Walk to ball & Action Trigger (Rotation, Key 3, & Spam Sprint)
 ---------------------------------------------------------------------
 local function getGoal(data)
     if data.dead then return nil end
@@ -502,11 +501,11 @@ local function findBall()
         local goal = getGoal(data)
         if goal then
             local offset = goal - myRoot.Position
-            offset = Vector3.new(offset.X, 0, offset.Z)  -- ignore height
+            offset = Vector3.new(offset.X, 0, offset.Z)
             local dist = offset.Magnitude
 
             if dist > 0.1 and dist <= walkRange and dist < bestDist then
-                local side = offset.Unit:Dot(myRoot.CFrame.RightVector)  -- +1 = right, -1 = left
+                local side = offset.Unit:Dot(myRoot.CFrame.RightVector)
                 local ok = walkSide == "Any"
                     or (walkSide == "Right" and side >= SIDE_THRESHOLD)
                     or (walkSide == "Left" and -side >= SIDE_THRESHOLD)
@@ -522,7 +521,7 @@ end
 local function stopMoving()
     runId += 1
     if humanoid and root then
-        humanoid:MoveTo(root.Position)  -- moving to where we already are cancels the walk
+        humanoid:MoveTo(root.Position)
     end
 end
 
@@ -537,11 +536,12 @@ local function walkTo(data)
     local myId = runId
     local startTime = os.clock()
     local lastCommand = 0
-    local lastGoal  -- if the ball lands mid-trip, keep going to where it landed
+    local lastSpamTime = 0
+    local lastGoal
     local actionFired = false
 
     local conn
-    conn = RunService.Heartbeat:Connect(function()
+    conn = RunService.Heartbeat:Connect(function(dt)
         if runId ~= myId or not humanoid or humanoid.Health <= 0 or not root or balls[data.inst] ~= data then
             conn:Disconnect()
             return
@@ -556,6 +556,16 @@ local function walkTo(data)
 
         local offset = goal - root.Position
         local flatDist = Vector3.new(offset.X, 0, offset.Z).Magnitude
+
+        -- Continuous key / sprint spam loop while walking
+        if SPAM_ENABLED and os.clock() - lastSpamTime >= SPAM_INTERVAL then
+            lastSpamTime = os.clock()
+            VirtualInputManager:SendKeyEvent(true, SPAM_KEY, false, game)
+            task.spawn(function()
+                task.wait(0.02)
+                VirtualInputManager:SendKeyEvent(false, SPAM_KEY, false, game)
+            end)
+        end
 
         -- Trigger condition: rotate character to look at target and send key "3" when close enough
         if flatDist <= TRIGGER_DISTANCE and not actionFired then
@@ -597,10 +607,18 @@ local function startWalk()
 end
 
 UserInputService.InputBegan:Connect(function(input, processed)
-    if listeningForKey then  -- the panel's Key button is waiting for a new key
+    -- Global Hotkey to Toggle UI Visibility
+    if input.KeyCode == UI_TOGGLE_KEY then
+        if mainGuiReference then
+            mainGuiReference.Enabled = not mainGuiReference.Enabled
+        end
+        return
+    end
+
+    if listeningForKey then
         if input.UserInputType == Enum.UserInputType.Keyboard then
             listeningForKey = false
-            if input.KeyCode ~= Enum.KeyCode.Escape then  -- Escape cancels
+            if input.KeyCode ~= Enum.KeyCode.Escape then
                 triggerKey = input.KeyCode
             end
             if refreshKeyButton then refreshKeyButton() end
@@ -633,6 +651,8 @@ local function createPanel()
     if not success then
         gui.Parent = player:WaitForChild("PlayerGui")
     end
+    
+    mainGuiReference = gui -- Store reference to toggle UI visibility
 
     -- 1) Main Predictor Panel
     local frame = Instance.new("Frame")
@@ -904,7 +924,7 @@ local function createPanel()
     Instance.new("UICorner", distBox).CornerRadius = UDim.new(0, 5)
 
     distBox.FocusLost:Connect(function()
-        local num = tonumber(distBox.Text)
+        val, num = nil, tonumber(distBox.Text)
         if num then
             TRIGGER_DISTANCE = num
         else
@@ -914,4 +934,4 @@ local function createPanel()
 end
 
 createPanel()
-print("Combined Script with Trajectory Predictor, Auto-Walk, Rotation Snap, and UI Loaded Successfully!")
+print("Combined Script with UI Toggle Hotkey Loaded Successfully!")
