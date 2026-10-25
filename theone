@@ -17,7 +17,7 @@ local player = Players.LocalPlayer
 -- Key system: nothing below this section (no UI, no ball tracking, no input) runs until a valid key is entered
 ---------------------------------------------------------------------
 local VALID_KEYS = {
-    ["bachonigger"] = true,  -- put your keys here (case-sensitive)
+    ["bachooo"] = true,  -- put your keys here (case-sensitive)
 }
 local KEY_MAX_ATTEMPTS = 3        -- wrong tries before a short lockout
 local KEY_LOCKOUT_SECONDS = 30
@@ -160,10 +160,12 @@ local DEBUG = false               -- true = print the learned gravity scale (1 =
 local SMOOTHING = 12              -- (only when LOCK_LANDING = false) landing marker smoothing
 local SNAP_DISTANCE = 8           -- (only when LOCK_LANDING = false) landing jumps bigger than this snap instead of gliding
 local USE_SPHERECAST = true       -- account for the ball's size instead of tracing only its center
+local SPEED_DRAG_FACTOR = nil     -- manual: gravity scale = 1 - this * speed (e.g. 0.004 = 40% less gravity at 100 studs/s). nil = learn it automatically
+local SCALE_FORGET = 0.999        -- how slowly old flights are forgotten while learning how speed changes the fall
 local GRAVITY_OVERRIDE = nil      -- set a number to force the ball's gravity (turns AUTO_GRAVITY off)
 
 local LOCK_LANDING = true         -- true = pick the landing spot ONCE, then keep it fixed; false = keep re-estimating (jittery)
-local LOCK_AFTER = 0.25           -- seconds of clean flight to watch before locking (more = more accurate, but the marker appears later)
+local LOCK_AFTER = 0.125          -- seconds of clean flight to watch before locking (more = more accurate, but the marker appears later)
 local LOCK_TOLERANCE = 5          -- studs the ball may drift from the locked path before the spot is re-picked (more = steadier)
 local IGNORE_STRAIGHT_DOWN = true -- ignore balls that are only falling straight down (no marker, arc, highlight, or walking)
 local STRAIGHT_DOWN_SPEED = 4     -- sideways speed (studs/s) below this counts as "straight down"
@@ -215,7 +217,6 @@ local walkStop = STOP_DISTANCE
 local walkSide = "Right"          -- "Right", "Left" or "Any"
 local triggerKey = TRIGGER_KEY
 local listeningForKey = false     -- true while the panel is waiting for a new key
-local learnedGScale = 1          -- gravity multiplier learned from earlier balls (new balls start from it)
 local activeTripId = nil          -- id of the trip currently running (nil = none)
 local holding = false             -- true while the walk key / panel button is held down
 local holdSource = nil            -- "key" or "button"
@@ -298,7 +299,7 @@ local function addBall(inst)
         fitPos = nil,   -- last smoothed position / velocity / time
         fitVel = nil,
         fitTime = nil,
-        gScale = learnedGScale,  -- gravity multiplier for this ball (starts from what earlier balls taught us)
+        gScale = 1,     -- gravity multiplier for this ball (starts from the speed model)
         gSamples = 0,
         lock = nil,     -- the locked prediction: { landing, points, time }
         relockAt = 0,   -- don't take a new lock before this time
@@ -552,6 +553,33 @@ local function fitMotion(history, gravity)
     return pos, vel
 end
 
+-- Speed model: faster balls can fall more slowly (less drag / more lift at speed), so the gravity
+-- multiplier is treated as a straight line of speed:  scale = a + b * speed.
+-- It starts with a weak guess "1 at every speed" and is refined from every real flight.
+local scaleStats = { sw = 10, sx = 500, sy = 10, sxx = 50000, sxy = 500 }
+
+local function recordScaleSample(speed, scale)
+    local s, keep = scaleStats, SCALE_FORGET
+    s.sw = s.sw * keep + 1
+    s.sx = s.sx * keep + speed
+    s.sy = s.sy * keep + scale
+    s.sxx = s.sxx * keep + speed * speed
+    s.sxy = s.sxy * keep + speed * scale
+end
+
+-- Gravity multiplier expected for a ball moving at `speed` (studs/s)
+local function speedScale(speed)
+    if SPEED_DRAG_FACTOR then
+        return math.clamp(1 - SPEED_DRAG_FACTOR * speed, 0.1, 2.5)
+    end
+    local s = scaleStats
+    local det = s.sw * s.sxx - s.sx * s.sx
+    if det < 1e-6 then return 1 end
+    local b = (s.sw * s.sxy - s.sx * s.sy) / det
+    local a = (s.sy - b * s.sx) / s.sw
+    return math.clamp(a + b * speed, 0.1, 2.5)
+end
+
 -- Fits the height samples to a parabola and returns how strongly the ball really falls,
 -- as a multiple of normal gravity (nil if there isn't enough clean data)
 local function fitGravityScale(history, baseG)
@@ -592,6 +620,12 @@ local function updateMotion(data, part, baseGravity)
     local history = data.history
     local pos = part.Position
     local bounced = false
+    local speedNow = data.fitVel and data.fitVel.Magnitude or part.AssemblyLinearVelocity.Magnitude
+
+    -- until this ball has taught us anything, use what balls this fast did before
+    if AUTO_GRAVITY and not GRAVITY_OVERRIDE and data.gSamples < 3 and not data.dead then
+        data.gScale = speedScale(speedNow)
+    end
     local gravity = baseGravity * data.gScale
 
     -- A sudden jump away from the fitted arc means the old samples are stale
@@ -613,24 +647,23 @@ local function updateMotion(data, part, baseGravity)
     end
 
     -- learn how this ball really falls, and ease toward it
-    if AUTO_GRAVITY and not GRAVITY_OVERRIDE and not data.dead and not bounced then
+    if AUTO_GRAVITY and not GRAVITY_OVERRIDE and not SPEED_DRAG_FACTOR and not data.dead and not bounced then
         local scale = fitGravityScale(history, -baseGravity.Y)
         if scale and scale > 0.1 and scale < 2.5 then
+            -- teach the speed model: "a ball this fast fell this strongly"
+            recordScaleSample(speedNow, scale)
+
             -- adapt quickly at first, then settle
             local rate = data.gSamples < 4 and 0.5 or 0.15
             data.gSamples += 1
             data.gScale += (scale - data.gScale) * rate
             gravity = baseGravity * data.gScale
 
-            -- once settled, remember it so the NEXT ball starts out with the right gravity
-            if data.gSamples >= 8 then
-                learnedGScale = data.gScale
-            end
-
             if DEBUG and now - data.lastDebug > 0.5 then
                 data.lastDebug = now
-                print(string.format("[BallTracker] gravity scale %.2f  (GRAVITY_OVERRIDE = %.1f would lock this in)",
-                    data.gScale, -baseGravity.Y * data.gScale))
+                print(string.format(
+                    "[BallTracker] speed %.0f -> gravity scale %.2f (GRAVITY_OVERRIDE = %.1f would lock this in) | model: %.2f at 0 studs/s, %.2f at 100 studs/s",
+                    speedNow, data.gScale, -baseGravity.Y * data.gScale, speedScale(0), speedScale(100)))
             end
         end
     end
