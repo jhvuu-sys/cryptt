@@ -1,6 +1,6 @@
 --- Combined LocalScript
---- 1) Press E: find the ball whose predicted landing spot is nearest on the character's right,
----    and walk right onto it
+--- 1) Press E (or click Walk Now in the panel): find the ball whose predicted landing spot is nearest
+---    on the chosen side (Right / Left / Any) of the character, and walk right onto it
 --- 2) Ball landing predictor: tracks every ball, marker + arc per ball, color panel, switches
 ---    (the walker reads the predictor's landing spots, so both share the same ball list)
 
@@ -12,11 +12,11 @@ local Workspace = game:GetService("Workspace")
 local player = Players.LocalPlayer
 
 ---------------------------------------------------------------------
--- Settings: walk to ball
+-- Settings: walk to ball (these are the defaults; the panel changes them live)
 ---------------------------------------------------------------------
 local TRIGGER_KEY = Enum.KeyCode.E
 local DETECT_RANGE = 40        -- how far away a ball's landing spot can be (studs)
-local RIGHT_THRESHOLD = 0.5    -- 1 = exactly right, 0.5 = within ~60 degrees of right
+local SIDE_THRESHOLD = 0.5     -- for Right / Left: 1 = exactly to the side, 0.5 = within ~60 degrees of it
 local STOP_DISTANCE = 1        -- how close counts as "on top of it" (studs); 0 = keep going until timeout
 local GIVE_UP_TIME = 8         -- stop trying after this many seconds
 
@@ -65,6 +65,14 @@ local runId = 0                   -- changes on every new trip so old trips canc
 local enabled = true              -- predictor master switch
 local arcEnabled = true           -- predictor arc switch
 local markerColor = PRESETS[1]
+
+local walkEnabled = true          -- walking master switch (panel)
+local walkRange = DETECT_RANGE    -- live values, changed from the panel
+local walkStop = STOP_DISTANCE
+local walkSide = "Right"          -- "Right", "Left" or "Any"
+local triggerKey = TRIGGER_KEY
+local listeningForKey = false     -- true while the panel is waiting for a new key
+local refreshKeyButton            -- set by the panel so the key button can update its label
 
 ---------------------------------------------------------------------
 -- Character binding (single handler for the whole script)
@@ -488,8 +496,8 @@ local function getGoal(data)
     return data.landing or part.Position
 end
 
--- Returns the tracked ball whose goal point is closest and on our right side
-local function findBallOnRight()
+-- Returns the tracked ball whose goal point is closest and on the chosen side
+local function findBall()
     local best, bestDist = nil, math.huge
     for _, data in pairs(balls) do
         local goal = getGoal(data)
@@ -498,10 +506,14 @@ local function findBallOnRight()
             offset = Vector3.new(offset.X, 0, offset.Z)  -- ignore height
             local dist = offset.Magnitude
 
-            if dist > 0.1 and dist <= DETECT_RANGE
-                and offset.Unit:Dot(root.CFrame.RightVector) >= RIGHT_THRESHOLD
-                and dist < bestDist then
-                best, bestDist = data, dist
+            if dist > 0.1 and dist <= walkRange and dist < bestDist then
+                local side = offset.Unit:Dot(root.CFrame.RightVector)  -- +1 = right, -1 = left
+                local ok = walkSide == "Any"
+                    or (walkSide == "Right" and side >= SIDE_THRESHOLD)
+                    or (walkSide == "Left" and -side >= SIDE_THRESHOLD)
+                if ok then
+                    best, bestDist = data, dist
+                end
             end
         end
     end
@@ -541,7 +553,7 @@ local function walkTo(data)
         local flatDist = Vector3.new(offset.X, 0, offset.Z).Magnitude
 
         -- Arrived, or took too long
-        if flatDist <= STOP_DISTANCE or os.clock() - startTime > GIVE_UP_TIME then
+        if flatDist <= walkStop or os.clock() - startTime > GIVE_UP_TIME then
             conn:Disconnect()
             humanoid:MoveTo(root.Position)
             return
@@ -556,16 +568,33 @@ local function walkTo(data)
     end)
 end
 
--- Single input handler. `processed` is true while typing in the hex box,
--- so pressing E there will not start a trip.
-UserInputService.InputBegan:Connect(function(input, processed)
-    if processed or input.KeyCode ~= TRIGGER_KEY then return end
+-- Starts a trip to the best ball (used by the key and by the panel's Walk Now button)
+local function startWalk()
+    if not walkEnabled then return end
     if not (humanoid and root) or humanoid.Health <= 0 then return end
 
-    local data = findBallOnRight()
+    local data = findBall()
     if data then
         walkTo(data)
     end
+end
+
+-- Single input handler. `processed` is true while typing in the hex box,
+-- so pressing the key there will not start a trip.
+UserInputService.InputBegan:Connect(function(input, processed)
+    if listeningForKey then  -- the panel's Key button is waiting for a new key
+        if input.UserInputType == Enum.UserInputType.Keyboard then
+            listeningForKey = false
+            if input.KeyCode ~= Enum.KeyCode.Escape then  -- Escape cancels
+                triggerKey = input.KeyCode
+            end
+            if refreshKeyButton then refreshKeyButton() end
+        end
+        return
+    end
+
+    if processed or input.KeyCode ~= triggerKey then return end
+    startWalk()
 end)
 
 ---------------------------------------------------------------------
@@ -585,8 +614,8 @@ local function createPanel()
     gui.Parent = player:WaitForChild("PlayerGui")
 
     local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 230, 0, 184)
-    frame.Position = UDim2.new(0, 20, 0.5, -92)
+    frame.Size = UDim2.new(0, 230, 0, 388)
+    frame.Position = UDim2.new(0, 20, 0.5, -194)
     frame.BackgroundColor3 = Color3.fromRGB(30, 30, 34)
     frame.BorderSizePixel = 0
     frame.Active = true
@@ -701,6 +730,114 @@ local function createPanel()
             for _, data in pairs(balls) do hideArc(data) end
         end
     end)
+
+    -----------------------------------------------------------------
+    -- Walking section
+    -----------------------------------------------------------------
+    local divider = Instance.new("Frame")
+    divider.Size = UDim2.new(1, -20, 0, 1)
+    divider.Position = UDim2.new(0, 10, 0, 172)
+    divider.BackgroundColor3 = Color3.fromRGB(70, 70, 78)
+    divider.BorderSizePixel = 0
+    divider.Parent = frame
+
+    local function makeLabel(text, y, header)
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.new(0, 100, 0, 24)
+        label.Position = UDim2.new(0, 10, 0, y)
+        label.BackgroundTransparency = 1
+        label.Text = text
+        label.TextColor3 = Color3.new(1, 1, 1)
+        label.Font = header and Enum.Font.GothamBold or Enum.Font.GothamMedium
+        label.TextSize = header and 14 or 13
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Parent = frame
+        return label
+    end
+
+    local function makeButton(text, x, y, w, h)
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0, w, 0, h)
+        btn.Position = UDim2.new(0, x, 0, y)
+        btn.BackgroundColor3 = Color3.fromRGB(50, 50, 58)
+        btn.BorderSizePixel = 0
+        btn.Text = text
+        btn.TextColor3 = Color3.new(1, 1, 1)
+        btn.Font = Enum.Font.GothamBold
+        btn.TextSize = 12
+        btn.Parent = frame
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 5)
+        return btn
+    end
+
+    -- "-  value  +" control
+    local function makeStepper(y, get, set, step, min, max)
+        local minus = makeButton("-", 110, y, 24, 24)
+        local plus = makeButton("+", 186, y, 24, 24)
+
+        local value = Instance.new("TextLabel")
+        value.Size = UDim2.new(0, 48, 0, 24)
+        value.Position = UDim2.new(0, 136, 0, y)
+        value.BackgroundTransparency = 1
+        value.TextColor3 = Color3.new(1, 1, 1)
+        value.Font = Enum.Font.GothamMedium
+        value.TextSize = 13
+        value.Parent = frame
+
+        local function change(delta)
+            local new = math.clamp(get() + delta, min, max)
+            set(math.floor(new * 10 + 0.5) / 10)
+            value.Text = tostring(get())
+        end
+        minus.Activated:Connect(function() change(-step) end)
+        plus.Activated:Connect(function() change(step) end)
+        value.Text = tostring(get())
+    end
+
+    makeLabel("Auto Walk", 182, true)
+
+    local walkToggleBtn = Instance.new("TextButton")
+    walkToggleBtn.Size = UDim2.new(0, 60, 0, 24)
+    walkToggleBtn.Position = UDim2.new(1, -70, 0, 182)
+    walkToggleBtn.Font = Enum.Font.GothamBold
+    walkToggleBtn.TextSize = 12
+    walkToggleBtn.TextColor3 = Color3.new(1, 1, 1)
+    walkToggleBtn.Parent = frame
+    Instance.new("UICorner", walkToggleBtn).CornerRadius = UDim.new(0, 5)
+    styleToggle(walkToggleBtn, walkEnabled)
+
+    walkToggleBtn.Activated:Connect(function()
+        walkEnabled = not walkEnabled
+        styleToggle(walkToggleBtn, walkEnabled)
+        if not walkEnabled then stopMoving() end  -- cancel a trip in progress
+    end)
+
+    makeLabel("Side", 218)
+    local sideBtn = makeButton(walkSide, 110, 218, 100, 24)
+    sideBtn.Activated:Connect(function()
+        walkSide = (walkSide == "Right" and "Left") or (walkSide == "Left" and "Any") or "Right"
+        sideBtn.Text = walkSide
+    end)
+
+    makeLabel("Range", 250)
+    makeStepper(250, function() return walkRange end, function(v) walkRange = v end, 5, 5, 200)
+
+    makeLabel("Stop dist.", 282)
+    makeStepper(282, function() return walkStop end, function(v) walkStop = v end, 0.5, 0, 10)
+
+    makeLabel("Key", 314)
+    local keyBtn = makeButton(triggerKey.Name, 110, 314, 100, 24)
+    refreshKeyButton = function()
+        keyBtn.Text = triggerKey.Name
+    end
+    keyBtn.Activated:Connect(function()
+        listeningForKey = true
+        keyBtn.Text = "Press a key..."
+    end)
+
+    local walkNowBtn = makeButton("Walk Now", 10, 348, 210, 28)
+    walkNowBtn.BackgroundColor3 = Color3.fromRGB(60, 110, 200)
+    walkNowBtn.Activated:Connect(startWalk)
 end
 
 createPanel()
