@@ -17,7 +17,7 @@ local player = Players.LocalPlayer
 -- Key system: nothing below this section (no UI, no ball tracking, no input) runs until a valid key is entered
 ---------------------------------------------------------------------
 local VALID_KEYS = {
-    ["bachooooo"] = true,  -- put your keys here (case-sensitive)
+    ["CHANGE-ME-1234"] = true,  -- put your keys here (case-sensitive)
 }
 local KEY_MAX_ATTEMPTS = 3        -- wrong tries before a short lockout
 local KEY_LOCKOUT_SECONDS = 30
@@ -172,6 +172,17 @@ local STRAIGHT_DOWN_SPEED = 4     -- sideways speed (studs/s) below this counts 
 local STRAIGHT_DOWN_DISTANCE = 3  -- a predicted spot closer than this (sideways) to the ball is "right under it" and never locked
 local STABLE_WINDOW = 0.06        -- the ball's velocity estimate must stay steady this long before locking (avoids locking on a half-updated estimate right after a hit)
 local STABLE_TOLERANCE = 2        -- studs/s of wobble (plus 4% of the speed) still counted as "steady"
+local USE_FACING = true           -- lock a first guess sooner by reading which way the nearest player is facing
+local FACING_RANGE = 15           -- the nearest player within this many studs of the ball counts as the hitter
+local FACING_CONE = 30            -- degrees: facing only counts when the ball is already heading roughly that way
+local REFINE_DISTANCE = 2         -- when the steady estimate arrives, an early lock is replaced only if it was off by more than this (studs)
+local USE_PREHIT = true           -- BEFORE a hit: if a player is under the ball, estimate the landing from where they face
+local HITTER_RADIUS = 5           -- a player counts as "under the ball" within this sideways distance (studs)...
+local HITTER_REACH = 12           -- ...and when the ball is no more than this far above them
+local HITTER_MIDAIR_ONLY = true   -- true = only players who are in the air; false = standing players count too
+local PREHIT_STEP = 4              -- the pre-hit estimate only moves when it changes by more than this (studs), so it stays steady
+local DEFAULT_HIT_SPEED = 40      -- until real hits have been seen: typical sideways speed of a hit ball (studs/s)
+local DEFAULT_HIT_VY = 25         -- ...and typical upward speed (studs/s)
 
 local TOUCH_GAP = 0.3             -- a ball only counts as landed when its surface is this close to the floor (studs); merely being near is not enough
 local FLOOR_REST_TIME = 0.15      -- ...or when it has stayed on the floor this long (rolling along it)
@@ -313,6 +324,8 @@ local function addBall(inst)
         lastVy = 0,
         velTrail = {},         -- recent velocity estimates, used to tell when the estimate has settled
         velStable = false,
+        quickVel = nil,        -- rough early velocity (few samples), used for the facing-assisted early lock
+        preHit = nil,          -- the pre-hit landing estimate currently shown
         fitSince = nil, -- when the motion estimate became available
         lastDebug = 0,
         dead = false,   -- landed: ignored for good (no marker, arc, or walking)
@@ -528,12 +541,12 @@ end
 ---------------------------------------------------------------------
 -- Returns the smoothed position and velocity at the latest sample, or nil if there isn't enough data.
 -- Recent samples count more than old ones, so a launch or a change of direction shows up quickly.
-local function fitMotion(history, gravity)
+local function fitMotion(history, gravity, minSamples, minSpan)
     local n = #history
-    if n < MIN_SAMPLES then return nil end
+    if n < (minSamples or MIN_SAMPLES) then return nil end
 
     local tLast = history[n].t
-    if tLast - history[1].t < 0.06 then return nil end
+    if tLast - history[1].t < (minSpan or 0.06) then return nil end
 
     -- remove gravity's effect, then fit a straight line:  pos - 0.5*g*tau^2 = pos0 + vel*tau
     local k = math.log(2) / RECENCY_HALF_LIFE
@@ -679,6 +692,7 @@ local function updateMotion(data, part, baseGravity)
     if fitPos then
         data.fitPos, data.fitVel, data.fitTime = fitPos, fitVel, now
         data.fitSince = data.fitSince or now
+        data.quickVel = nil
 
         -- Is the velocity estimate steady? Compare with a moment ago (allowing for gravity). Right after
         -- a hit the estimate is still catching up, and locking on it gives a wrong spot under the ball.
@@ -703,6 +717,12 @@ local function updateMotion(data, part, baseGravity)
     data.fitSince = nil
     table.clear(data.velTrail)
     data.velStable = false
+    if USE_FACING then
+        local _, quickVel = fitMotion(history, gravity, 3, 0.03)  -- rough, from just 3 samples
+        data.quickVel = quickVel
+    else
+        data.quickVel = nil
+    end
     local vel = part.AssemblyLinearVelocity
     local n = #history
     if vel.Magnitude < 1 and n >= 2 then
@@ -741,6 +761,106 @@ local function remainingPath(lock, now)
         table.insert(out, pts[k])
     end
     return out, i + 1
+end
+
+-- What a typical hit looks like, learned from the real hits seen so far (used for the pre-hit estimate)
+local typicalHitFlat = DEFAULT_HIT_SPEED
+local typicalHitVy = DEFAULT_HIT_VY
+
+local function learnHit(vel, g)
+    local flat = Vector3.new(vel.X, 0, vel.Z).Magnitude
+    if flat < STRAIGHT_DOWN_SPEED then return end
+    typicalHitFlat += (flat - typicalHitFlat) * 0.25
+    -- the velocity is read a moment after the hit, so add back what gravity already took off
+    typicalHitVy += ((vel.Y - g.Y * 0.1) - typicalHitVy) * 0.25
+end
+
+-- A player under the ball (in the air by default) who is about to hit it
+local function findHitterUnder(pos)
+    local best, bestDist = nil, HITTER_RADIUS
+    for _, plr in ipairs(Players:GetPlayers()) do
+        local char = plr.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if hrp and hum and hum.Health > 0 then
+            local flatDist = Vector3.new(hrp.Position.X - pos.X, 0, hrp.Position.Z - pos.Z).Magnitude
+            local above = pos.Y - hrp.Position.Y  -- how far the ball is above them
+            local airborne = hum.FloorMaterial == Enum.Material.Air
+            if flatDist < bestDist and above > -2 and above < HITTER_REACH
+                and (airborne or not HITTER_MIDAIR_ONLY) then
+                best, bestDist = hrp, flatDist
+            end
+        end
+    end
+    return best
+end
+
+-- Approximate landing before the hit: the hitter's facing direction + a typical hit's speed and height
+local function preHitLanding(data, pos, radius, g)
+    local hrp = findHitterUnder(pos)
+    if not hrp then
+        data.preHit = nil
+        return nil
+    end
+
+    local look = Vector3.new(hrp.CFrame.LookVector.X, 0, hrp.CFrame.LookVector.Z)
+    if look.Magnitude < 1e-3 then
+        data.preHit = nil
+        return nil
+    end
+    look = look.Unit
+
+    local landing = predictLanding(pos, Vector3.new(look.X * typicalHitFlat, typicalHitVy, look.Z * typicalHitFlat), radius, g)
+    if not landing then
+        data.preHit = nil
+        return nil
+    end
+
+    -- keep the shown spot steady unless the estimate really moves (the hitter turning)
+    local shown = data.preHit
+    if shown and (landing - shown).Magnitude < PREHIT_STEP then
+        return shown
+    end
+    data.preHit = landing
+    return landing
+end
+
+-- Builds a lock from a velocity (nil if there's no landing, or it would be right under the ball)
+local function makeLock(pos, vel, radius, g, now)
+    local landing, points = predictLanding(pos, vel, radius, g)
+    if not landing then return nil end
+    if IGNORE_STRAIGHT_DOWN then
+        local sideways = Vector3.new(landing.X - pos.X, 0, landing.Z - pos.Z).Magnitude
+        if sideways < STRAIGHT_DOWN_DISTANCE then return nil end
+    end
+    return { landing = landing, points = points, time = now }
+end
+
+-- The horizontal direction the nearest player (the likely hitter) is facing, but only if the ball is
+-- already heading roughly that way. Facing never overrides what the ball is actually doing.
+local function facingDirection(pos, vel)
+    local flat = Vector3.new(vel.X, 0, vel.Z)
+    if flat.Magnitude < 1e-3 then return nil end
+    local heading = flat.Unit
+
+    local nearest, nearestDist = nil, FACING_RANGE
+    for _, plr in ipairs(Players:GetPlayers()) do
+        local char = plr.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            local d = (hrp.Position - pos).Magnitude
+            if d < nearestDist then
+                nearest, nearestDist = hrp, d
+            end
+        end
+    end
+    if not nearest then return nil end
+
+    local look = Vector3.new(nearest.CFrame.LookVector.X, 0, nearest.CFrame.LookVector.Z)
+    if look.Magnitude < 1e-3 then return nil end
+    look = look.Unit
+    if look:Dot(heading) < math.cos(math.rad(FACING_CONE)) then return nil end
+    return look
 end
 
 RunService.Heartbeat:Connect(function(dt)
@@ -789,6 +909,7 @@ RunService.Heartbeat:Connect(function(dt)
                 hideBall(data)  -- no marker, no arc, nothing to walk to
             else
                 local landing, points, startAbs
+                local estimate = false  -- true while the shown spot is only a pre-hit guess
                 local flatSpeed = Vector3.new(vel.X, 0, vel.Z).Magnitude
                 local straightDown = IGNORE_STRAIGHT_DOWN and flatSpeed < STRAIGHT_DOWN_SPEED
 
@@ -812,24 +933,58 @@ RunService.Heartbeat:Connect(function(dt)
                         end
                     end
 
-                    -- take a new lock once the motion estimate has had a moment to settle
-                    if not lock and not straightDown and data.velStable and data.fitSince
+                    -- steady estimate available: take a lock, or check an early one against it
+                    if data.velStable and not straightDown and data.fitSince
                         and now - data.fitSince >= LOCK_AFTER and now >= data.relockAt then
-                        local newLanding, newPoints = predictLanding(pos, vel, radius, g)
-                        if newLanding and IGNORE_STRAIGHT_DOWN then
-                            -- a spot right under the ball is the "falling straight down" case: don't use it
-                            local sideways = Vector3.new(newLanding.X - pos.X, 0, newLanding.Z - pos.Z).Magnitude
-                            if sideways < STRAIGHT_DOWN_DISTANCE then newLanding = nil end
-                        end
-                        if newLanding then
-                            lock = { landing = newLanding, points = newPoints, time = now }
+                        if not lock then
+                            lock = makeLock(pos, vel, radius, g, now)
                             data.lock = lock
+                            if lock then learnHit(vel, g) end
+                        elseif lock.early then
+                            -- replace the early guess only if it was clearly off (at most one adjustment)
+                            local refined = makeLock(pos, vel, radius, g, now)
+                            if refined then
+                                local off = Vector3.new(refined.landing.X - lock.landing.X, 0,
+                                    refined.landing.Z - lock.landing.Z).Magnitude
+                                if off > REFINE_DISTANCE then
+                                    lock = refined
+                                    data.lock = lock
+                                    learnHit(vel, g)
+                                end
+                            end
+                            lock.early = nil
+                        end
+                    end
+
+                    -- Not steady yet: lock an early guess from the hitter's facing direction
+                    if not lock and USE_FACING and data.quickVel and now >= data.relockAt then
+                        local qv = data.quickVel
+                        local qFlat = Vector3.new(qv.X, 0, qv.Z).Magnitude
+                        if qFlat >= STRAIGHT_DOWN_SPEED then
+                            local dir = facingDirection(pos, qv)
+                            if dir then
+                                -- measured speed and height, but the cleaner facing direction
+                                local early = makeLock(pos, Vector3.new(dir.X * qFlat, qv.Y, dir.Z * qFlat), radius, g, now)
+                                if early then
+                                    early.early = true
+                                    lock = early
+                                    data.lock = lock
+                                end
+                            end
                         end
                     end
 
                     if lock then
                         landing = lock.landing
                         points, startAbs = remainingPath(lock, now)
+                        data.preHit = nil
+                    elseif USE_PREHIT then
+                        -- nothing real to lock yet: is a player under the ball about to hit it?
+                        local guess = preHitLanding(data, pos, radius, g)
+                        if guess then
+                            landing = guess
+                            estimate = true
+                        end
                     end
                 else
                     if not straightDown then
@@ -845,11 +1000,11 @@ RunService.Heartbeat:Connect(function(dt)
                 end
 
                 data.landing = landing
-                data.straightDown = straightDown and not data.lock  -- an already-locked ball is never dropped
+                data.straightDown = straightDown and not data.lock and not estimate  -- an already-locked ball is never dropped
 
                 -- the panel switches only control what is drawn; tracking (and walking) keeps running
                 if enabled and landing then
-                    data.marker.Transparency = 0.35
+                    data.marker.Transparency = estimate and 0.6 or 0.35  -- fainter while it is only a guess
                     data.marker.CFrame = CFrame.new(landing + Vector3.new(0, 0.1, 0))
                         * CFrame.Angles(0, 0, math.rad(90))
                 else
