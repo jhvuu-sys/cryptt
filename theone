@@ -1,0 +1,706 @@
+--- Combined LocalScript
+--- 1) Press E: find the ball whose predicted landing spot is nearest on the character's right,
+---    and walk right onto it
+--- 2) Ball landing predictor: tracks every ball, marker + arc per ball, color panel, switches
+---    (the walker reads the predictor's landing spots, so both share the same ball list)
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+
+---------------------------------------------------------------------
+-- Settings: walk to ball
+---------------------------------------------------------------------
+local TRIGGER_KEY = Enum.KeyCode.E
+local DETECT_RANGE = 40        -- how far away a ball's landing spot can be (studs)
+local RIGHT_THRESHOLD = 0.5    -- 1 = exactly right, 0.5 = within ~60 degrees of right
+local STOP_DISTANCE = 1        -- how close counts as "on top of it" (studs); 0 = keep going until timeout
+local GIVE_UP_TIME = 8         -- stop trying after this many seconds
+
+---------------------------------------------------------------------
+-- Settings: ball landing predictor
+---------------------------------------------------------------------
+local BALL_NAME = "Ball"          -- every Part or Model with this name is tracked AND is what E walks to
+local MAX_BALLS = 10              -- safety cap on how many balls are tracked at once
+local STEP = 1 / 30               -- simulation step (seconds)
+local MAX_TIME = 6                -- how far ahead to predict (seconds)
+
+local IGNORE_INVISIBLE = true     -- skip parts that are (nearly) transparent
+local INVISIBLE_THRESHOLD = 0.95  -- Transparency at or above this counts as invisible
+
+local SAMPLE_WINDOW = 0.25        -- seconds of recent movement used to smooth the ball's position/velocity
+local MIN_SAMPLES = 4             -- need at least this many samples before trusting the smoothing
+local RESET_ERROR = 2             -- studs off the predicted arc before old samples are thrown out (bounce, hit, teleport)
+local SMOOTHING = 12              -- landing marker smoothing (higher = snappier, lower = steadier)
+local SNAP_DISTANCE = 8           -- landing jumps bigger than this snap instead of gliding
+local USE_SPHERECAST = true       -- account for the ball's size instead of tracing only its center
+local GRAVITY_OVERRIDE = nil      -- set a number if your ball falls differently from Workspace.Gravity
+
+local DEAD_DISTANCE = 6          -- ball bounced within this many studs of its predicted landing spot = it landed
+local LAND_TOUCH = 1              -- or it got this close (beyond its own radius) to the landing spot
+
+local ARC_STRIDE = 2              -- draw one segment per this many steps (higher = fewer parts)
+local ARC_THICKNESS = 0.25
+local ARC_TRANSPARENCY = 0.35
+local ARC_DASHED = true           -- true = dashed line, false = solid
+
+local PRESETS = {
+    Color3.fromRGB(255, 70, 70),   -- red
+    Color3.fromRGB(255, 160, 40),  -- orange
+    Color3.fromRGB(250, 220, 60),  -- yellow
+    Color3.fromRGB(60, 220, 100),  -- green
+    Color3.fromRGB(70, 160, 255),  -- blue
+    Color3.fromRGB(190, 100, 255), -- purple
+}
+
+---------------------------------------------------------------------
+-- Shared state
+---------------------------------------------------------------------
+local humanoid, root              -- current character parts (walk-to-target)
+local runId = 0                   -- changes on every new trip so old trips cancel themselves
+
+local enabled = true              -- predictor master switch
+local arcEnabled = true           -- predictor arc switch
+local markerColor = PRESETS[1]
+
+---------------------------------------------------------------------
+-- Character binding (single handler for the whole script)
+---------------------------------------------------------------------
+local function bindCharacter(char)
+    runId += 1  -- cancel any trip left over from the previous character
+    humanoid = char:WaitForChild("Humanoid")
+    root = char:WaitForChild("HumanoidRootPart")
+end
+bindCharacter(player.Character or player.CharacterAdded:Wait())
+player.CharacterAdded:Connect(bindCharacter)
+
+---------------------------------------------------------------------
+-- Predictor: shared folders (one place for the raycast to ignore all visuals)
+---------------------------------------------------------------------
+local markerFolder = Instance.new("Folder")
+markerFolder.Name = "LandingMarkers"
+markerFolder.Parent = Workspace
+
+local arcFolder = Instance.new("Folder")
+arcFolder.Name = "TrajectoryArcs"
+arcFolder.Parent = Workspace
+
+local highlightFolder = Instance.new("Folder")
+highlightFolder.Name = "BallHighlights"
+highlightFolder.Parent = Workspace
+
+---------------------------------------------------------------------
+-- Predictor: per-ball tracking
+---------------------------------------------------------------------
+local balls = {}      -- [instance] = data table for that ball
+local ballCount = 0
+
+local function createMarker()
+    local marker = Instance.new("Part")
+    marker.Name = "LandingMarker"
+    marker.Shape = Enum.PartType.Cylinder
+    marker.Size = Vector3.new(0.15, 5, 5)
+    marker.Anchored = true
+    marker.CanCollide = false
+    marker.CanQuery = false
+    marker.CanTouch = false
+    marker.Material = Enum.Material.Neon
+    marker.Color = markerColor
+    marker.Transparency = 1
+    marker.Parent = markerFolder
+    return marker
+end
+
+local function createHighlight()
+    local highlight = Instance.new("Highlight")
+    highlight.FillColor = markerColor
+    highlight.FillTransparency = 0.6
+    highlight.OutlineColor = Color3.new(1, 1, 1)
+    highlight.Parent = highlightFolder
+    return highlight
+end
+
+local function addBall(inst)
+    if balls[inst] then return end
+    if inst.Name ~= BALL_NAME then return end
+    if not (inst:IsA("BasePart") or inst:IsA("Model")) then return end
+    if ballCount >= MAX_BALLS then return end
+
+    local folder = Instance.new("Folder")
+    folder.Name = "Arc"
+    folder.Parent = arcFolder
+
+    balls[inst] = {
+        inst = inst,
+        part = nil,
+        landing = nil,  -- predicted landing position, read by the walker
+        history = {},   -- recent { t, pos } samples used to smooth the motion
+        fitPos = nil,   -- last smoothed position / velocity / time
+        fitVel = nil,
+        fitTime = nil,
+        dead = false,   -- landed: ignored for good (no marker, arc, or walking)
+        marker = createMarker(),
+        highlight = createHighlight(),
+        folder = folder,
+        segments = {},  -- pooled arc parts for this ball
+    }
+    ballCount += 1
+end
+
+local function removeBall(inst)
+    local data = balls[inst]
+    if not data then return end
+    data.marker:Destroy()
+    data.highlight:Destroy()
+    data.folder:Destroy()
+    balls[inst] = nil
+    ballCount -= 1
+end
+
+-- Resolves the BasePart to read position/velocity from (handles Models)
+local function getPart(data)
+    local part = data.part
+    if part and part.Parent then return part end
+
+    local inst = data.inst
+    if inst:IsA("BasePart") then
+        part = inst
+    else
+        part = inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart", true)
+    end
+    data.part = part
+    return part
+end
+
+-- Pick up balls that already exist, then watch for new/removed ones
+for _, d in ipairs(Workspace:GetDescendants()) do
+    addBall(d)
+end
+Workspace.DescendantAdded:Connect(addBall)
+Workspace.DescendantRemoving:Connect(removeBall)
+
+---------------------------------------------------------------------
+-- Predictor: arc drawing (per ball)
+---------------------------------------------------------------------
+local function getSegment(data, index)
+    local seg = data.segments[index]
+    if not seg then
+        seg = Instance.new("Part")
+        seg.Anchored = true
+        seg.CanCollide = false
+        seg.CanQuery = false
+        seg.CanTouch = false
+        seg.CastShadow = false
+        seg.Material = Enum.Material.Neon
+        seg.Transparency = 1
+        seg.Parent = data.folder
+        data.segments[index] = seg
+    end
+    return seg
+end
+
+local function hideArc(data)
+    for _, seg in ipairs(data.segments) do
+        seg.Transparency = 1
+    end
+end
+
+local function drawArc(data, points)
+    local used = 0
+    local i = 1
+    while i < #points do
+        local j = math.min(i + ARC_STRIDE, #points)
+        used += 1
+
+        local a, b = points[i], points[j]
+        local length = (b - a).Magnitude
+        local seg = getSegment(data, used)
+
+        if length > 0.01 and not (ARC_DASHED and used % 2 == 0) then
+            seg.Size = Vector3.new(ARC_THICKNESS, ARC_THICKNESS, length)
+            seg.CFrame = CFrame.lookAt((a + b) / 2, b)
+            seg.Color = markerColor
+            seg.Transparency = ARC_TRANSPARENCY
+        else
+            seg.Transparency = 1
+        end
+
+        i = j
+    end
+
+    for k = used + 1, #data.segments do
+        data.segments[k].Transparency = 1
+    end
+end
+
+local function hideVisuals(data)
+    data.marker.Transparency = 1
+    data.highlight.Adornee = nil
+    hideArc(data)
+end
+
+local function hideBall(data)
+    data.landing = nil
+    hideVisuals(data)
+end
+
+local function hideAll()
+    for _, data in pairs(balls) do
+        hideVisuals(data)
+    end
+end
+
+local function setMarkerColor(color)
+    markerColor = color
+    for _, data in pairs(balls) do
+        data.marker.Color = color
+        data.highlight.FillColor = color
+    end
+    -- arc segments pick up the new color on the next draw
+end
+
+---------------------------------------------------------------------
+-- Predictor: prediction
+---------------------------------------------------------------------
+local skipped = setmetatable({}, { __mode = "k" })  -- invisible parts we've learned to ignore
+local rayParams                                      -- shared by all balls, rebuilt each frame
+
+local function buildRayParams()
+    local ignore = { markerFolder, arcFolder, highlightFolder }
+    for inst in pairs(balls) do
+        table.insert(ignore, inst)  -- every tracked ball ignores every other ball
+    end
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr.Character then table.insert(ignore, plr.Character) end
+    end
+    for part in pairs(skipped) do
+        table.insert(ignore, part)
+    end
+
+    local p = RaycastParams.new()
+    p.FilterType = Enum.RaycastFilterType.Exclude
+    p.FilterDescendantsInstances = ignore
+    p.RespectCanCollide = true  -- ignores parts with CanCollide = false
+    return p
+end
+
+-- Radius of the ball (used so the arc ends when the ball's SURFACE touches, not its center)
+local function getRadius(data, part)
+    if not USE_SPHERECAST then return 0 end
+    local size = data.inst:IsA("Model") and data.inst:GetExtentsSize() or part.Size
+    return math.min(size.X, size.Y, size.Z) / 2
+end
+
+-- Casts one segment, skipping invisible parts and re-casting past them
+local function castSegment(from, to, radius)
+    local dir = to - from
+    for _ = 1, 6 do
+        local hit
+        if radius > 0.05 then
+            -- slightly smaller than the ball so a ball resting on the ground doesn't start "inside" it
+            hit = Workspace:Spherecast(from, radius * 0.95, dir, rayParams)
+        else
+            hit = Workspace:Raycast(from, dir, rayParams)
+        end
+        if not hit then return nil end
+
+        local part = hit.Instance
+        if IGNORE_INVISIBLE and part.Transparency >= INVISIBLE_THRESHOLD then
+            skipped[part] = true
+            rayParams = buildRayParams()
+        else
+            return hit
+        end
+    end
+    return nil
+end
+
+-- Returns the landing position (or nil) and every point along the path
+local function predictLanding(pos, vel, radius, gravity)
+    local points = { pos }
+    local t = 0
+    while t < MAX_TIME do
+        local newPos = pos + vel * STEP + 0.5 * gravity * STEP * STEP
+        local move = newPos - pos
+        if move.Magnitude < 1e-4 then break end
+
+        local hit = castSegment(pos, newPos, radius)
+        if hit then
+            -- the arc ends where the ball's center is at impact; the marker goes on the surface it hits
+            table.insert(points, pos + move.Unit * hit.Distance)
+            return hit.Position, points
+        end
+        table.insert(points, newPos)
+        vel = vel + gravity * STEP
+        pos = newPos
+        t += STEP
+    end
+    return nil, points
+end
+
+---------------------------------------------------------------------
+-- Predictor: motion tracking
+-- Reading one frame of position/velocity is noisy (network updates arrive in steps), which
+-- makes the arc jitter. Instead, fit the last fraction of a second of positions to a gravity arc.
+---------------------------------------------------------------------
+-- Returns the smoothed position and velocity at the latest sample, or nil if there isn't enough data
+local function fitMotion(history, gravity)
+    local n = #history
+    if n < MIN_SAMPLES then return nil end
+
+    local tLast = history[n].t
+    if tLast - history[1].t < 0.06 then return nil end
+
+    -- remove gravity's effect, then fit a straight line:  pos - 0.5*g*tau^2 = pos0 + vel*tau
+    local sT, sTT = 0, 0
+    local sY, sTY = Vector3.zero, Vector3.zero
+    for _, s in ipairs(history) do
+        local tau = s.t - tLast
+        local y = s.pos - 0.5 * gravity * tau * tau
+        sT += tau
+        sTT += tau * tau
+        sY += y
+        sTY += y * tau
+    end
+
+    local denom = n * sTT - sT * sT
+    if denom < 1e-9 then return nil end
+
+    local vel = (sTY * n - sY * sT) / denom
+    local pos = (sY - vel * sT) / n
+    return pos, vel
+end
+
+-- Returns the smoothed position, velocity, and whether the ball just left its arc (bounce, hit, teleport)
+local function updateMotion(data, part, gravity)
+    local now = os.clock()
+    local history = data.history
+    local pos = part.Position
+    local bounced = false
+
+    -- A sudden jump away from the fitted arc means the old samples are stale
+    if data.fitPos then
+        local tau = now - data.fitTime
+        local expected = data.fitPos + data.fitVel * tau + 0.5 * gravity * tau * tau
+        local allowed = RESET_ERROR + data.fitVel.Magnitude * 0.06
+        if (pos - expected).Magnitude > allowed then
+            table.clear(history)
+            data.fitPos = nil
+            bounced = true
+        end
+    end
+
+    table.insert(history, { t = now, pos = pos })
+    while #history > 2 and now - history[1].t > SAMPLE_WINDOW do
+        table.remove(history, 1)
+    end
+
+    local fitPos, fitVel = fitMotion(history, gravity)
+    if fitPos then
+        data.fitPos, data.fitVel, data.fitTime = fitPos, fitVel, now
+        return fitPos, fitVel, bounced
+    end
+
+    -- not enough samples yet: fall back to what the engine reports
+    data.fitPos = nil
+    return pos, part.AssemblyLinearVelocity, bounced
+end
+
+RunService.Heartbeat:Connect(function(dt)
+    rayParams = buildRayParams()  -- once per frame, shared by every ball
+    local gravity = Vector3.new(0, -(GRAVITY_OVERRIDE or Workspace.Gravity), 0)
+
+    for inst, data in pairs(balls) do
+        local part = getPart(data)
+
+        if not part then
+            table.clear(data.history)
+            data.fitPos = nil
+            hideBall(data)
+        else
+            local pos, vel, bounced = updateMotion(data, part, gravity)
+            local radius = getRadius(data, part)
+
+            if not data.dead then
+                -- Did it just land? (reached the predicted spot, or bounced right next to it)
+                local last = data.landing
+                if last then
+                    local away = (pos - last).Magnitude
+                    if away < radius + LAND_TOUCH or (bounced and away < DEAD_DISTANCE) then
+                        data.dead = true  -- permanent: the bounce is ignored from here on
+                    end
+                end
+            end
+
+            if data.dead then
+                hideBall(data)  -- no marker, no arc, nothing to walk to
+            else
+                local landing, points = predictLanding(pos, vel, radius, gravity)
+
+                if landing then
+                    -- glide the landing spot toward each new estimate so it doesn't twitch
+                    local prev = data.landing
+                    if prev and (landing - prev).Magnitude < SNAP_DISTANCE then
+                        landing = prev:Lerp(landing, 1 - math.exp(-SMOOTHING * dt))
+                    end
+                    data.landing = landing
+                else
+                    data.landing = nil
+                end
+
+                -- the panel switches only control what is drawn; tracking (and walking) keeps running
+                if enabled and landing then
+                    data.marker.Transparency = 0.35
+                    data.marker.CFrame = CFrame.new(landing + Vector3.new(0, 0.1, 0))
+                        * CFrame.Angles(0, 0, math.rad(90))
+                else
+                    data.marker.Transparency = 1
+                end
+
+                if enabled then
+                    data.highlight.Adornee = inst
+                    if arcEnabled then
+                        drawArc(data, points)
+                    else
+                        hideArc(data)
+                    end
+                else
+                    data.highlight.Adornee = nil
+                    hideArc(data)
+                end
+            end
+        end
+    end
+end)
+
+---------------------------------------------------------------------
+-- Walk to ball (goes right onto its predicted landing spot)
+---------------------------------------------------------------------
+-- Where we want to stand: the predicted landing spot if there is one,
+-- otherwise the ball itself (no prediction yet). Dead (landed) balls are ignored.
+local function getGoal(data)
+    if data.dead then return nil end
+    local part = getPart(data)
+    if not part then return nil end
+    return data.landing or part.Position
+end
+
+-- Returns the tracked ball whose goal point is closest and on our right side
+local function findBallOnRight()
+    local best, bestDist = nil, math.huge
+    for _, data in pairs(balls) do
+        local goal = getGoal(data)
+        if goal then
+            local offset = goal - root.Position
+            offset = Vector3.new(offset.X, 0, offset.Z)  -- ignore height
+            local dist = offset.Magnitude
+
+            if dist > 0.1 and dist <= DETECT_RANGE
+                and offset.Unit:Dot(root.CFrame.RightVector) >= RIGHT_THRESHOLD
+                and dist < bestDist then
+                best, bestDist = data, dist
+            end
+        end
+    end
+    return best
+end
+
+local function stopMoving()
+    runId += 1
+    if humanoid and root then
+        humanoid:MoveTo(root.Position)  -- moving to where we already are cancels the walk
+    end
+end
+
+local function walkTo(data)
+    runId += 1
+    local myId = runId
+    local startTime = os.clock()
+    local lastCommand = 0
+    local lastGoal  -- if the ball lands mid-trip, keep going to where it landed
+
+    local conn
+    conn = RunService.Heartbeat:Connect(function()
+        -- Cancelled, died, or the ball was removed
+        if runId ~= myId or humanoid.Health <= 0 or balls[data.inst] ~= data then
+            conn:Disconnect()
+            return
+        end
+
+        local goal = getGoal(data) or lastGoal
+        if not goal then
+            conn:Disconnect()
+            return
+        end
+        lastGoal = goal
+
+        local offset = goal - root.Position
+        local flatDist = Vector3.new(offset.X, 0, offset.Z).Magnitude
+
+        -- Arrived, or took too long
+        if flatDist <= STOP_DISTANCE or os.clock() - startTime > GIVE_UP_TIME then
+            conn:Disconnect()
+            humanoid:MoveTo(root.Position)
+            return
+        end
+
+        -- MoveTo expires after ~8 s and the goal keeps changing as the prediction updates,
+        -- so re-issue it a few times per second
+        if os.clock() - lastCommand > 0.25 then
+            lastCommand = os.clock()
+            humanoid:MoveTo(goal)
+        end
+    end)
+end
+
+-- Single input handler. `processed` is true while typing in the hex box,
+-- so pressing E there will not start a trip.
+UserInputService.InputBegan:Connect(function(input, processed)
+    if processed or input.KeyCode ~= TRIGGER_KEY then return end
+    if not (humanoid and root) or humanoid.Health <= 0 then return end
+
+    local data = findBallOnRight()
+    if data then
+        walkTo(data)
+    end
+end)
+
+---------------------------------------------------------------------
+-- Predictor: settings panel
+---------------------------------------------------------------------
+local function styleToggle(btn, on)
+    btn.Text = on and "ON" or "OFF"
+    btn.BackgroundColor3 = on
+        and Color3.fromRGB(35, 165, 89)
+        or Color3.fromRGB(190, 60, 60)
+end
+
+local function createPanel()
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "MarkerColorPanel"
+    gui.ResetOnSpawn = false
+    gui.Parent = player:WaitForChild("PlayerGui")
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(0, 230, 0, 184)
+    frame.Position = UDim2.new(0, 20, 0.5, -92)
+    frame.BackgroundColor3 = Color3.fromRGB(30, 30, 34)
+    frame.BorderSizePixel = 0
+    frame.Active = true
+    frame.Draggable = true  -- deprecated but still works; drag the panel anywhere
+    frame.Parent = gui
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -90, 0, 24)
+    title.Position = UDim2.new(0, 10, 0, 8)
+    title.BackgroundTransparency = 1
+    title.Text = "Landing Marker"
+    title.TextColor3 = Color3.new(1, 1, 1)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 14
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = frame
+
+    local toggleBtn = Instance.new("TextButton")
+    toggleBtn.Size = UDim2.new(0, 60, 0, 24)
+    toggleBtn.Position = UDim2.new(1, -70, 0, 8)
+    toggleBtn.Font = Enum.Font.GothamBold
+    toggleBtn.TextSize = 12
+    toggleBtn.TextColor3 = Color3.new(1, 1, 1)
+    toggleBtn.Parent = frame
+    Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 5)
+    styleToggle(toggleBtn, enabled)
+
+    toggleBtn.Activated:Connect(function()
+        enabled = not enabled
+        styleToggle(toggleBtn, enabled)
+        if not enabled then hideAll() end
+    end)
+
+    for i, color in ipairs(PRESETS) do
+        local swatch = Instance.new("TextButton")
+        swatch.Size = UDim2.new(0, 28, 0, 28)
+        swatch.Position = UDim2.new(0, 10 + (i - 1) * 35, 0, 48)
+        swatch.BackgroundColor3 = color
+        swatch.Text = ""
+        swatch.Parent = frame
+        Instance.new("UICorner", swatch).CornerRadius = UDim.new(0, 6)
+
+        swatch.Activated:Connect(function()
+            setMarkerColor(color)
+        end)
+    end
+
+    local hexLabel = Instance.new("TextLabel")
+    hexLabel.Size = UDim2.new(0, 50, 0, 26)
+    hexLabel.Position = UDim2.new(0, 10, 0, 90)
+    hexLabel.BackgroundTransparency = 1
+    hexLabel.Text = "Hex #"
+    hexLabel.TextColor3 = Color3.new(1, 1, 1)
+    hexLabel.Font = Enum.Font.GothamMedium
+    hexLabel.TextSize = 13
+    hexLabel.TextXAlignment = Enum.TextXAlignment.Left
+    hexLabel.Parent = frame
+
+    local hexBox = Instance.new("TextBox")
+    hexBox.Size = UDim2.new(1, -80, 0, 26)
+    hexBox.Position = UDim2.new(0, 60, 0, 90)
+    hexBox.BackgroundColor3 = Color3.fromRGB(50, 50, 58)
+    hexBox.BorderSizePixel = 0
+    hexBox.PlaceholderText = "FF4646"
+    hexBox.Text = ""
+    hexBox.TextColor3 = Color3.new(1, 1, 1)
+    hexBox.Font = Enum.Font.Gotham
+    hexBox.TextSize = 13
+    hexBox.ClearTextOnFocus = false
+    hexBox.Parent = frame
+    Instance.new("UICorner", hexBox).CornerRadius = UDim.new(0, 5)
+
+    hexBox.FocusLost:Connect(function()
+        local hex = hexBox.Text:gsub("#", ""):gsub("%s", "")
+        if #hex == 6 and hex:match("^%x+$") then
+            setMarkerColor(Color3.fromRGB(
+                tonumber(hex:sub(1, 2), 16),
+                tonumber(hex:sub(3, 4), 16),
+                tonumber(hex:sub(5, 6), 16)
+            ))
+        else
+            hexBox.Text = ""  -- invalid input, keep the current color
+        end
+    end)
+
+    local arcLabel = Instance.new("TextLabel")
+    arcLabel.Size = UDim2.new(1, -90, 0, 24)
+    arcLabel.Position = UDim2.new(0, 10, 0, 134)
+    arcLabel.BackgroundTransparency = 1
+    arcLabel.Text = "Trajectory Arc"
+    arcLabel.TextColor3 = Color3.new(1, 1, 1)
+    arcLabel.Font = Enum.Font.GothamMedium
+    arcLabel.TextSize = 13
+    arcLabel.TextXAlignment = Enum.TextXAlignment.Left
+    arcLabel.Parent = frame
+
+    local arcBtn = Instance.new("TextButton")
+    arcBtn.Size = UDim2.new(0, 60, 0, 24)
+    arcBtn.Position = UDim2.new(1, -70, 0, 134)
+    arcBtn.Font = Enum.Font.GothamBold
+    arcBtn.TextSize = 12
+    arcBtn.TextColor3 = Color3.new(1, 1, 1)
+    arcBtn.Parent = frame
+    Instance.new("UICorner", arcBtn).CornerRadius = UDim.new(0, 5)
+    styleToggle(arcBtn, arcEnabled)
+
+    arcBtn.Activated:Connect(function()
+        arcEnabled = not arcEnabled
+        styleToggle(arcBtn, arcEnabled)
+        if not arcEnabled then
+            for _, data in pairs(balls) do hideArc(data) end
+        end
+    end)
+end
+
+createPanel()
