@@ -17,7 +17,7 @@ local player = Players.LocalPlayer
 -- Key system: nothing below this section (no UI, no ball tracking, no input) runs until a valid key is entered
 ---------------------------------------------------------------------
 local VALID_KEYS = {
-    ["bachooo"] = true,  -- put your keys here (case-sensitive)
+    ["bachooooo"] = true,  -- put your keys here (case-sensitive)
 }
 local KEY_MAX_ATTEMPTS = 3        -- wrong tries before a short lockout
 local KEY_LOCKOUT_SECONDS = 30
@@ -165,10 +165,13 @@ local SCALE_FORGET = 0.999        -- how slowly old flights are forgotten while 
 local GRAVITY_OVERRIDE = nil      -- set a number to force the ball's gravity (turns AUTO_GRAVITY off)
 
 local LOCK_LANDING = true         -- true = pick the landing spot ONCE, then keep it fixed; false = keep re-estimating (jittery)
-local LOCK_AFTER = 0.125          -- seconds of clean flight to watch before locking (more = more accurate, but the marker appears later)
+local LOCK_AFTER = 0.06           -- seconds of clean flight to watch before locking (more = more accurate, but the marker appears later)
 local LOCK_TOLERANCE = 5          -- studs the ball may drift from the locked path before the spot is re-picked (more = steadier)
 local IGNORE_STRAIGHT_DOWN = true -- ignore balls that are only falling straight down (no marker, arc, highlight, or walking)
 local STRAIGHT_DOWN_SPEED = 4     -- sideways speed (studs/s) below this counts as "straight down"
+local STRAIGHT_DOWN_DISTANCE = 3  -- a predicted spot closer than this (sideways) to the ball is "right under it" and never locked
+local STABLE_WINDOW = 0.06        -- the ball's velocity estimate must stay steady this long before locking (avoids locking on a half-updated estimate right after a hit)
+local STABLE_TOLERANCE = 2        -- studs/s of wobble (plus 4% of the speed) still counted as "steady"
 
 local TOUCH_GAP = 0.3             -- a ball only counts as landed when its surface is this close to the floor (studs); merely being near is not enough
 local FLOOR_REST_TIME = 0.15      -- ...or when it has stayed on the floor this long (rolling along it)
@@ -308,6 +311,8 @@ local function addBall(inst)
         groundTime = 0,        -- how long it has been on the floor
         lastGap = nil,         -- floor gap and vertical speed from the previous frame
         lastVy = 0,
+        velTrail = {},         -- recent velocity estimates, used to tell when the estimate has settled
+        velStable = false,
         fitSince = nil, -- when the motion estimate became available
         lastDebug = 0,
         dead = false,   -- landed: ignored for good (no marker, arc, or walking)
@@ -637,6 +642,8 @@ local function updateMotion(data, part, baseGravity)
             table.clear(history)
             data.fitPos = nil
             data.fitSince = nil
+            table.clear(data.velTrail)
+            data.velStable = false
             bounced = true
         end
     end
@@ -672,12 +679,30 @@ local function updateMotion(data, part, baseGravity)
     if fitPos then
         data.fitPos, data.fitVel, data.fitTime = fitPos, fitVel, now
         data.fitSince = data.fitSince or now
+
+        -- Is the velocity estimate steady? Compare with a moment ago (allowing for gravity). Right after
+        -- a hit the estimate is still catching up, and locking on it gives a wrong spot under the ball.
+        local trail = data.velTrail
+        table.insert(trail, { t = now, v = fitVel })
+        while #trail > 1 and now - trail[2].t >= STABLE_WINDOW do
+            table.remove(trail, 1)
+        end
+        local old = trail[1]
+        local age = now - old.t
+        data.velStable = false
+        if age >= STABLE_WINDOW * 0.8 then
+            local expected = old.v + gravity * age
+            data.velStable = (fitVel - expected).Magnitude <= STABLE_TOLERANCE + fitVel.Magnitude * 0.04
+        end
+
         return fitPos, fitVel, bounced, gravity
     end
 
     -- not enough samples yet: use what the engine reports...
     data.fitPos = nil
     data.fitSince = nil
+    table.clear(data.velTrail)
+    data.velStable = false
     local vel = part.AssemblyLinearVelocity
     local n = #history
     if vel.Magnitude < 1 and n >= 2 then
@@ -778,12 +803,24 @@ RunService.Heartbeat:Connect(function(dt)
                             data.lock = nil
                             data.relockAt = now + LOCK_AFTER
                             lock = nil
+                            -- start fresh: the old samples are from before the hit
+                            table.clear(data.history)
+                            data.fitPos = nil
+                            data.fitSince = nil
+                            table.clear(data.velTrail)
+                            data.velStable = false
                         end
                     end
 
                     -- take a new lock once the motion estimate has had a moment to settle
-                    if not lock and not straightDown and data.fitSince and now - data.fitSince >= LOCK_AFTER and now >= data.relockAt then
+                    if not lock and not straightDown and data.velStable and data.fitSince
+                        and now - data.fitSince >= LOCK_AFTER and now >= data.relockAt then
                         local newLanding, newPoints = predictLanding(pos, vel, radius, g)
+                        if newLanding and IGNORE_STRAIGHT_DOWN then
+                            -- a spot right under the ball is the "falling straight down" case: don't use it
+                            local sideways = Vector3.new(newLanding.X - pos.X, 0, newLanding.Z - pos.Z).Magnitude
+                            if sideways < STRAIGHT_DOWN_DISTANCE then newLanding = nil end
+                        end
                         if newLanding then
                             lock = { landing = newLanding, points = newPoints, time = now }
                             data.lock = lock
