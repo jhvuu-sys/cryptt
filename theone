@@ -23,7 +23,7 @@ local STOP_DISTANCE = 1        -- how close counts as "on top of it" (studs); 0 
 local GIVE_UP_TIME = 8         -- stop trying after this many seconds
 
 ---------------------------------------------------------------------
--- Settings: ball landing predictor
+-- Settings: ball landing predictor & Action triggers
 ---------------------------------------------------------------------
 local BALL_NAME = "Ball"         -- every Part or Model with this name is tracked AND is what E walks to
 local MAX_BALLS = 10             -- safety cap on how many balls are tracked at once
@@ -48,6 +48,11 @@ local ARC_STRIDE = 2              -- draw one segment per this many steps (highe
 local ARC_THICKNESS = 0.25
 local ARC_TRANSPARENCY = 0.35
 local ARC_DASHED = true           -- true = dashed line, false = solid
+
+-- Virtual Action Settings (Key "3" & Rotation Snap)
+local ACTION_KEY = Enum.KeyCode.Three
+local TRIGGER_DISTANCE = 5      -- Distance (studs) from target to snap-look and press "3"
+local FIRE_ONCE_PER_TRIP = true -- Prevents spamming "3" repeatedly on the same run
 
 local PRESETS = {
     Color3.fromRGB(255, 70, 70),   -- red
@@ -479,7 +484,7 @@ RunService.Heartbeat:Connect(function(dt)
 end)
 
 ---------------------------------------------------------------------
--- Walk to ball & Action trigger implementation
+-- Walk to ball & Action Trigger (Rotation + Key 3)
 ---------------------------------------------------------------------
 local function getGoal(data)
     if data.dead then return nil end
@@ -490,15 +495,18 @@ end
 
 local function findBall()
     local best, bestDist = nil, math.huge
+    local myRoot = root
+    if not myRoot then return nil end
+
     for _, data in pairs(balls) do
         local goal = getGoal(data)
         if goal then
-            local offset = goal - root.Position
+            local offset = goal - myRoot.Position
             offset = Vector3.new(offset.X, 0, offset.Z)  -- ignore height
             local dist = offset.Magnitude
 
             if dist > 0.1 and dist <= walkRange and dist < bestDist then
-                local side = offset.Unit:Dot(root.CFrame.RightVector)  -- +1 = right, -1 = left
+                local side = offset.Unit:Dot(myRoot.CFrame.RightVector)  -- +1 = right, -1 = left
                 local ok = walkSide == "Any"
                     or (walkSide == "Right" and side >= SIDE_THRESHOLD)
                     or (walkSide == "Left" and -side >= SIDE_THRESHOLD)
@@ -514,7 +522,7 @@ end
 local function stopMoving()
     runId += 1
     if humanoid and root then
-        humanoid:MoveTo(root.Position)
+        humanoid:MoveTo(root.Position)  -- moving to where we already are cancels the walk
     end
 end
 
@@ -529,12 +537,12 @@ local function walkTo(data)
     local myId = runId
     local startTime = os.clock()
     local lastCommand = 0
-    local lastGoal
+    local lastGoal  -- if the ball lands mid-trip, keep going to where it landed
     local actionFired = false
 
     local conn
     conn = RunService.Heartbeat:Connect(function()
-        if runId ~= myId or humanoid.Health <= 0 or balls[data.inst] ~= data then
+        if runId ~= myId or not humanoid or humanoid.Health <= 0 or not root or balls[data.inst] ~= data then
             conn:Disconnect()
             return
         end
@@ -549,22 +557,17 @@ local function walkTo(data)
         local offset = goal - root.Position
         local flatDist = Vector3.new(offset.X, 0, offset.Z).Magnitude
 
-        -- Configuration variables for virtual key actions & rotation snap
-        local TRIGGER_DISTANCE = 5      -- Distance (studs) to snap rotation and fire key "3"
-        local ACTION_KEY = Enum.KeyCode.Three
-        local FIRE_ONCE_PER_TRIP = true
-
-        -- Check if we are within trigger distance to snap rotation and input "3"
+        -- Trigger condition: rotate character to look at target and send key "3" when close enough
         if flatDist <= TRIGGER_DISTANCE and not actionFired then
             if FIRE_ONCE_PER_TRIP then
                 actionFired = true
             end
 
-            -- Snap character orientation horizontally (Yaw only) to look directly at the target marker/goal
+            -- Snap orientation horizontally (Yaw only) toward the target goal/marker
             local lookTarget = Vector3.new(goal.X, root.Position.Y, goal.Z)
             root.CFrame = CFrame.lookAt(root.Position, lookTarget)
 
-            -- Simulate pressing key "3"
+            -- Send virtual input press for Key "3"
             simulateKeyPress(ACTION_KEY)
         end
 
@@ -575,6 +578,7 @@ local function walkTo(data)
             return
         end
 
+        -- MoveTo re-issued periodically to handle moving landing predictions
         if os.clock() - lastCommand > 0.25 then
             lastCommand = os.clock()
             humanoid:MoveTo(goal)
@@ -593,10 +597,10 @@ local function startWalk()
 end
 
 UserInputService.InputBegan:Connect(function(input, processed)
-    if listeningForKey then
+    if listeningForKey then  -- the panel's Key button is waiting for a new key
         if input.UserInputType == Enum.UserInputType.Keyboard then
             listeningForKey = false
-            if input.KeyCode ~= Enum.KeyCode.Escape then
+            if input.KeyCode ~= Enum.KeyCode.Escape then  -- Escape cancels
                 triggerKey = input.KeyCode
             end
             if refreshKeyButton then refreshKeyButton() end
@@ -609,7 +613,7 @@ UserInputService.InputBegan:Connect(function(input, processed)
 end)
 
 ---------------------------------------------------------------------
--- Predictor: settings panel
+-- Predictor & Action Settings Panels
 ---------------------------------------------------------------------
 local function styleToggle(btn, on)
     btn.Text = on and "ON" or "OFF"
@@ -620,7 +624,7 @@ end
 
 local function createPanel()
     local gui = Instance.new("ScreenGui")
-    gui.Name = "WalkerSettingsUI"
+    gui.Name = "MarkerColorPanel"
     gui.ResetOnSpawn = false
     
     local success = pcall(function()
@@ -630,6 +634,7 @@ local function createPanel()
         gui.Parent = player:WaitForChild("PlayerGui")
     end
 
+    -- 1) Main Predictor Panel
     local frame = Instance.new("Frame")
     frame.Size = UDim2.new(0, 230, 0, 388)
     frame.Position = UDim2.new(0, 20, 0.5, -194)
@@ -851,7 +856,62 @@ local function createPanel()
     local walkNowBtn = makeButton("Walk Now", 10, 348, 210, 28)
     walkNowBtn.BackgroundColor3 = Color3.fromRGB(60, 110, 200)
     walkNowBtn.Activated:Connect(startWalk)
+
+    -- 2) Secondary Action Config Panel (Trigger Distance for Key 3)
+    local actionFrame = Instance.new("Frame")
+    actionFrame.Size = UDim2.new(0, 230, 0, 80)
+    actionFrame.Position = UDim2.new(0, 260, 0.5, -194)
+    actionFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 34)
+    actionFrame.BorderSizePixel = 0
+    actionFrame.Active = true
+    actionFrame.Draggable = true
+    actionFrame.Parent = gui
+    Instance.new("UICorner", actionFrame).CornerRadius = UDim.new(0, 8)
+
+    local actionTitle = Instance.new("TextLabel")
+    actionTitle.Size = UDim2.new(1, -20, 0, 24)
+    actionTitle.Position = UDim2.new(0, 10, 0, 8)
+    actionTitle.BackgroundTransparency = 1
+    actionTitle.Text = "Action Config (Key 3)"
+    actionTitle.TextColor3 = Color3.new(1, 1, 1)
+    actionTitle.Font = Enum.Font.GothamBold
+    actionTitle.TextSize = 13
+    actionTitle.TextXAlignment = Enum.TextXAlignment.Left
+    actionTitle.Parent = actionFrame
+
+    local distLbl = Instance.new("TextLabel")
+    distLbl.Size = UDim2.new(0, 120, 0, 24)
+    distLbl.Position = UDim2.new(0, 10, 0, 40)
+    distLbl.BackgroundTransparency = 1
+    distLbl.Text = "Trigger Dist."
+    distLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+    distLbl.Font = Enum.Font.GothamMedium
+    distLbl.TextSize = 13
+    distLbl.TextXAlignment = Enum.TextXAlignment.Left
+    distLbl.Parent = actionFrame
+
+    local distBox = Instance.new("TextBox")
+    distBox.Size = UDim2.new(0, 80, 0, 24)
+    distBox.Position = UDim2.new(1, -90, 0, 40)
+    distBox.BackgroundColor3 = Color3.fromRGB(50, 50, 58)
+    distBox.BorderSizePixel = 0
+    distBox.Text = tostring(TRIGGER_DISTANCE)
+    distBox.TextColor3 = Color3.new(1, 1, 1)
+    distBox.Font = Enum.Font.Gotham
+    distBox.TextSize = 13
+    distBox.ClearTextOnFocus = false
+    distBox.Parent = actionFrame
+    Instance.new("UICorner", distBox).CornerRadius = UDim.new(0, 5)
+
+    distBox.FocusLost:Connect(function()
+        local num = tonumber(distBox.Text)
+        if num then
+            TRIGGER_DISTANCE = num
+        else
+            distBox.Text = tostring(TRIGGER_DISTANCE)
+        end
+    end)
 end
 
 createPanel()
-print("Combined Script with Auto-Rotation and UI Extension Loaded!")
+print("Combined Script with Trajectory Predictor, Auto-Walk, Rotation Snap, and UI Loaded Successfully!")
