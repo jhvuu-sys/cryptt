@@ -17,7 +17,7 @@ local player = Players.LocalPlayer
 -- Key system: nothing below this section (no UI, no ball tracking, no input) runs until a valid key is entered
 ---------------------------------------------------------------------
 local VALID_KEYS = {
-    ["BACHO_BO"] = true,  -- put your keys here (case-sensitive)
+    ["CHANGE-ME-1234"] = true,  -- put your keys here (case-sensitive)
 }
 local KEY_MAX_ATTEMPTS = 3        -- wrong tries before a short lockout
 local KEY_LOCKOUT_SECONDS = 30
@@ -157,13 +157,19 @@ local RESET_ERROR = 0.75          -- studs off the predicted arc before old samp
 local RECENCY_HALF_LIFE = 0.1     -- newer samples count more; every this many seconds an older sample counts half as much
 local AUTO_GRAVITY = true         -- learn how this ball really falls (custom gravity / lift) from its own flight
 local DEBUG = false               -- true = print the learned gravity scale (1 = normal Roblox gravity)
-local SMOOTHING = 12              -- landing marker smoothing (higher = snappier, lower = steadier)
-local SNAP_DISTANCE = 8           -- landing jumps bigger than this snap instead of gliding
+local SMOOTHING = 12              -- (only when LOCK_LANDING = false) landing marker smoothing
+local SNAP_DISTANCE = 8           -- (only when LOCK_LANDING = false) landing jumps bigger than this snap instead of gliding
 local USE_SPHERECAST = true       -- account for the ball's size instead of tracing only its center
 local GRAVITY_OVERRIDE = nil      -- set a number to force the ball's gravity (turns AUTO_GRAVITY off)
 
-local DEAD_DISTANCE = 6          -- ball bounced within this many studs of its predicted landing spot = it landed
-local LAND_TOUCH = 1              -- or it got this close (beyond its own radius) to the landing spot
+local LOCK_LANDING = true         -- true = pick the landing spot ONCE, then keep it fixed; false = keep re-estimating (jittery)
+local LOCK_AFTER = 0.25           -- seconds of clean flight to watch before locking (more = more accurate, but the marker appears later)
+local LOCK_TOLERANCE = 5          -- studs the ball may drift from the locked path before the spot is re-picked (more = steadier)
+local IGNORE_STRAIGHT_DOWN = true -- ignore balls that are only falling straight down (no marker, arc, highlight, or walking)
+local STRAIGHT_DOWN_SPEED = 4     -- sideways speed (studs/s) below this counts as "straight down"
+
+local TOUCH_GAP = 0.3             -- a ball only counts as landed when its surface is this close to the floor (studs); merely being near is not enough
+local FLOOR_REST_TIME = 0.15      -- ...or when it has stayed on the floor this long (rolling along it)
 
 local ARC_STRIDE = 2              -- draw one segment per this many steps (higher = fewer parts)
 local ARC_THICKNESS = 0.25
@@ -294,6 +300,14 @@ local function addBall(inst)
         fitTime = nil,
         gScale = learnedGScale,  -- gravity multiplier for this ball (starts from what earlier balls taught us)
         gSamples = 0,
+        lock = nil,     -- the locked prediction: { landing, points, time }
+        relockAt = 0,   -- don't take a new lock before this time
+        straightDown = false,  -- falling straight down: ignored
+        wasAirborne = false,   -- has been up in the air (so touching the floor means it landed)
+        groundTime = 0,        -- how long it has been on the floor
+        lastGap = nil,         -- floor gap and vertical speed from the previous frame
+        lastVy = 0,
+        fitSince = nil, -- when the motion estimate became available
         lastDebug = 0,
         dead = false,   -- landed: ignored for good (no marker, arc, or walking)
         marker = createMarker(),
@@ -362,18 +376,22 @@ local function hideArc(data)
     end
 end
 
-local function drawArc(data, points)
+-- `startAbs` = grid index of the first point; it keeps the dashes in fixed places as the arc shrinks
+local function drawArc(data, points, startAbs)
     local used = 0
     local i = 1
+    local abs = startAbs or 1
     while i < #points do
-        local j = math.min(i + ARC_STRIDE, #points)
+        local stride = (i == 1) and (ARC_STRIDE - ((abs - 1) % ARC_STRIDE)) or ARC_STRIDE
+        local j = math.min(i + stride, #points)
         used += 1
+        local segIndex = math.floor((abs - 1) / ARC_STRIDE)
 
         local a, b = points[i], points[j]
         local length = (b - a).Magnitude
         local seg = getSegment(data, used)
 
-        if length > 0.01 and not (ARC_DASHED and used % 2 == 0) then
+        if length > 0.01 and not (ARC_DASHED and segIndex % 2 == 1) then
             seg.Size = Vector3.new(ARC_THICKNESS, ARC_THICKNESS, length)
             seg.CFrame = CFrame.lookAt((a + b) / 2, b)
             seg.Color = markerColor
@@ -382,6 +400,7 @@ local function drawArc(data, points)
             seg.Transparency = 1
         end
 
+        abs += (j - i)
         i = j
     end
 
@@ -398,6 +417,7 @@ end
 
 local function hideBall(data)
     data.landing = nil
+    data.lock = nil
     hideVisuals(data)
 end
 
@@ -582,6 +602,7 @@ local function updateMotion(data, part, baseGravity)
         if (pos - expected).Magnitude > allowed then
             table.clear(history)
             data.fitPos = nil
+            data.fitSince = nil
             bounced = true
         end
     end
@@ -617,11 +638,13 @@ local function updateMotion(data, part, baseGravity)
     local fitPos, fitVel = fitMotion(history, gravity)
     if fitPos then
         data.fitPos, data.fitVel, data.fitTime = fitPos, fitVel, now
+        data.fitSince = data.fitSince or now
         return fitPos, fitVel, bounced, gravity
     end
 
     -- not enough samples yet: use what the engine reports...
     data.fitPos = nil
+    data.fitSince = nil
     local vel = part.AssemblyLinearVelocity
     local n = #history
     if vel.Magnitude < 1 and n >= 2 then
@@ -634,6 +657,32 @@ local function updateMotion(data, part, baseGravity)
         end
     end
     return pos, vel, bounced, gravity
+end
+
+-- Space between the ball's surface and the floor straight below it (nil if the floor is farther than `reach`)
+local function groundGap(pos, radius, reach)
+    local hit = castSegment(pos, pos + Vector3.new(0, -reach, 0), radius)
+    return hit and hit.Distance or nil
+end
+
+-- Where the ball should be right now according to a locked prediction
+local function lockedPosition(lock, now)
+    local pts = lock.points
+    local f = (now - lock.time) / STEP  -- prediction steps elapsed since the lock
+    local i = math.floor(f)
+    if i + 2 > #pts then return pts[#pts] end
+    return pts[i + 1]:Lerp(pts[i + 2], f - i)
+end
+
+-- The part of the locked path the ball hasn't flown yet, and the grid index it starts at
+local function remainingPath(lock, now)
+    local pts = lock.points
+    local i = math.floor((now - lock.time) / STEP)
+    local out = { lockedPosition(lock, now) }
+    for k = i + 2, #pts do
+        table.insert(out, pts[k])
+    end
+    return out, i + 1
 end
 
 RunService.Heartbeat:Connect(function(dt)
@@ -652,31 +701,81 @@ RunService.Heartbeat:Connect(function(dt)
             local radius = getRadius(data, part)
 
             if not data.dead then
-                -- Did it just land? (reached the predicted spot, or bounced right next to it)
-                local last = data.landing
-                if last then
-                    local away = (pos - last).Magnitude
-                    if away < radius + LAND_TOUCH or (bounced and away < DEAD_DISTANCE) then
-                        data.dead = true  -- permanent: the bounce is ignored from here on
-                    end
+                -- Did it just land? Only real floor contact counts. Being close to the floor is not enough:
+                -- a ball that gets hit or dug up from just above the floor is still live.
+                local vy = vel.Y
+                local gap = groundGap(pos, radius, 3 + math.abs(vy) * 0.05)
+                local touchGap = TOUCH_GAP + radius * 0.05
+
+                if gap == nil or gap > 2 then data.wasAirborne = true end
+
+                local touching = gap ~= nil and gap <= touchGap
+                data.groundTime = touching and (data.groundTime + dt) or 0
+
+                -- a fast ball can touch and bounce between two frames: it was about to touch last frame
+                -- and has now left its arc
+                local bouncedOff = bounced and data.lastGap ~= nil
+                    and data.lastGap <= math.abs(data.lastVy) * dt * 1.5 + touchGap
+
+                if data.wasAirborne and ((touching and vy <= 5) or bouncedOff) then
+                    data.dead = true  -- permanent: the bounce is ignored from here on
+                elseif data.groundTime >= FLOOR_REST_TIME then
+                    data.dead = true  -- sitting / rolling on the floor
                 end
+
+                data.lastGap = gap
+                data.lastVy = vy
             end
 
             if data.dead then
                 hideBall(data)  -- no marker, no arc, nothing to walk to
             else
-                local landing, points = predictLanding(pos, vel, radius, g)
+                local landing, points, startAbs
+                local flatSpeed = Vector3.new(vel.X, 0, vel.Z).Magnitude
+                local straightDown = IGNORE_STRAIGHT_DOWN and flatSpeed < STRAIGHT_DOWN_SPEED
 
-                if landing then
-                    -- glide the landing spot toward each new estimate so it doesn't twitch
-                    local prev = data.landing
-                    if prev and (landing - prev).Magnitude < SNAP_DISTANCE then
-                        landing = prev:Lerp(landing, 1 - math.exp(-SMOOTHING * dt))
+                if LOCK_LANDING then
+                    local now = os.clock()
+                    local lock = data.lock
+
+                    -- drop the lock if the ball has left the locked path (hit, deflected, or well off)
+                    if lock then
+                        local expected = lockedPosition(lock, now)
+                        if (pos - expected).Magnitude > LOCK_TOLERANCE + vel.Magnitude * 0.05 then
+                            data.lock = nil
+                            data.relockAt = now + LOCK_AFTER
+                            lock = nil
+                        end
                     end
-                    data.landing = landing
+
+                    -- take a new lock once the motion estimate has had a moment to settle
+                    if not lock and not straightDown and data.fitSince and now - data.fitSince >= LOCK_AFTER and now >= data.relockAt then
+                        local newLanding, newPoints = predictLanding(pos, vel, radius, g)
+                        if newLanding then
+                            lock = { landing = newLanding, points = newPoints, time = now }
+                            data.lock = lock
+                        end
+                    end
+
+                    if lock then
+                        landing = lock.landing
+                        points, startAbs = remainingPath(lock, now)
+                    end
                 else
-                    data.landing = nil
+                    if not straightDown then
+                        landing, points = predictLanding(pos, vel, radius, g)
+                    end
+                    if landing then
+                        -- glide the landing spot toward each new estimate so it doesn't twitch
+                        local prev = data.landing
+                        if prev and (landing - prev).Magnitude < SNAP_DISTANCE then
+                            landing = prev:Lerp(landing, 1 - math.exp(-SMOOTHING * dt))
+                        end
+                    end
                 end
+
+                data.landing = landing
+                data.straightDown = straightDown and not data.lock  -- an already-locked ball is never dropped
 
                 -- the panel switches only control what is drawn; tracking (and walking) keeps running
                 if enabled and landing then
@@ -688,9 +787,9 @@ RunService.Heartbeat:Connect(function(dt)
                 end
 
                 if enabled then
-                    data.highlight.Adornee = inst
-                    if arcEnabled then
-                        drawArc(data, points)
+                    data.highlight.Adornee = (not data.straightDown) and inst or nil
+                    if arcEnabled and points then
+                        drawArc(data, points, startAbs)
                     else
                         hideArc(data)
                     end
@@ -709,9 +808,10 @@ end)
 -- Where we want to stand: the predicted landing spot if there is one,
 -- otherwise the ball itself (no prediction yet). Dead (landed) balls are ignored.
 local function getGoal(data)
-    if data.dead then return nil end
+    if data.dead or data.straightDown then return nil end
     local part = getPart(data)
     if not part then return nil end
+    if LOCK_LANDING then return data.landing end  -- wait for the locked spot instead of guessing
     return data.landing or part.Position
 end
 
