@@ -156,7 +156,7 @@ local MIN_SAMPLES = 4             -- need at least this many samples before trus
 local RESET_ERROR = 0.75          -- studs off the predicted arc before old samples are thrown out (launch, bounce, hit)
 local RECENCY_HALF_LIFE = 0.1     -- newer samples count more; every this many seconds an older sample counts half as much
 local AUTO_GRAVITY = true         -- learn how this ball really falls (custom gravity / lift) from its own flight
-local DEBUG = false               -- true = print the learned gravity scale (1 = normal Roblox gravity)
+local DEBUG = true               -- true = print the learned gravity scale (1 = normal Roblox gravity)
 local SMOOTHING = 12              -- (only when LOCK_LANDING = false) landing marker smoothing
 local SNAP_DISTANCE = 8           -- (only when LOCK_LANDING = false) landing jumps bigger than this snap instead of gliding
 local USE_SPHERECAST = true       -- account for the ball's size instead of tracing only its center
