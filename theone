@@ -17,7 +17,7 @@ local player = Players.LocalPlayer
 -- Key system: nothing below this section (no UI, no ball tracking, no input) runs until a valid key is entered
 ---------------------------------------------------------------------
 local VALID_KEYS = {
-    ["demarcussu"] = true,  -- put your keys here (case-sensitive)
+    ["de4m"] = true,  -- put your keys here (case-sensitive)
 }
 local KEY_MAX_ATTEMPTS = 3        -- wrong tries before a short lockout
 local KEY_LOCKOUT_SECONDS = 30
@@ -171,7 +171,7 @@ local IGNORE_STRAIGHT_DOWN = true -- ignore balls that are only falling straight
 local STRAIGHT_DOWN_SPEED = 4     -- sideways speed (studs/s) below this counts as "straight down"
 local STRAIGHT_DOWN_DISTANCE = 3  -- a predicted spot closer than this (sideways) to the ball is "right under it" and never locked
 local STABLE_WINDOW = 0.06        -- the ball's velocity estimate must stay steady this long before locking (avoids locking on a half-updated estimate right after a hit)
-local STABLE_TOLERANCE = 2        -- studs/s of wobble (plus 4% of the speed) still counted as "steady"
+local STABLE_TOLERANCE = 2        -- studs/s of wobble (plus 5% of the speed) still counted as "steady"
 local USE_FAST_LOCK = true        -- lock right away when the engine's own velocity agrees with how the ball really moved (a few frames after the hit)
 local FAST_MIN_SAMPLES = 3        -- ...checked over at least this many samples
 local FAST_MIN_SPAN = 0.03        -- ...spanning at least this many seconds
@@ -180,7 +180,7 @@ local FAST_TOLERANCE_PCT = 0.08
 local USE_INSTANT_LOCK = true     -- for very fast balls about to hit the floor: lock from the engine's velocity at once, without the usual checks
 local INSTANT_MIN_SPEED = 50      -- ...only balls at least this fast (studs/s)...
 local INSTANT_TIME = 0.4          -- ...that would reach the floor within this many seconds
-local CLEAN_TOLERANCE = 0.5       -- studs a sample may sit off the fitted arc (plus 3% of the speed) and still count as a "clean arc"
+local CLEAN_TOLERANCE = 0.5       -- studs a sample may sit off the fitted arc (plus 4% of the speed) and still count as a "clean arc"
 local USE_FACING = true           -- use the facing line of the player under the ball (read just before the hit) for the ball's direction
 local FACING_CONE = 45            -- degrees: the hitter's facing line is trusted only if the ball is heading roughly that way (otherwise the ball's own direction is used)
 local HITDIR_MAX_AGE = 1          -- seconds the hitter's facing (read just BEFORE the hit) stays usable
@@ -190,6 +190,12 @@ local CHANGE_JUMP = 20            -- studs/s: a sudden change in the ball's velo
 local HITTER_RADIUS = 5           -- a player counts as "under the ball" within this sideways distance (studs)...
 local HITTER_REACH = 12           -- ...and when the ball is no more than this far above them
 local HITTER_MIDAIR_ONLY = true   -- true = only players who are in the air; false = standing players count too
+
+local REVIVE_BALLS = true         -- a landed ball can come back to life (so a ball that is reset/reused, or one that settled and is hit again, gets marked again)
+local RESET_JUMP = 15             -- ...when it suddenly appears this many studs away (reset / teleported back to a player)
+local REST_SPEED = 3              -- ...or when it has settled (slower than this, studs/s)...
+local REST_TIME = 0.3             -- ...for this long...
+local LAUNCH_SPEED = 15           -- ...and is then launched faster than this (studs/s). A bounce right after landing is NOT enough: it has to settle first.
 
 local LEARN_RANGE = true          -- learn from where balls really land: if fast balls usually land longer than predicted, future predictions are stretched to match
 local RANGE_SPEED_FACTOR = nil    -- manual instead: range multiplier = 1 + this * sideways speed (e.g. 0.0012 = +12% at 100 studs/s). nil = learn it automatically
@@ -341,6 +347,10 @@ local function addBall(inst)
         fastVel = nil,  -- the engine's velocity, once it has been checked against the real movement
         clean = false,  -- recent movement forms a clean arc
         evTrail = {},   -- recent engine velocities, used to spot a sudden change of direction
+        lastRawPos = nil,  -- raw position last frame (to measure real movement and spot a reset)
+        speedEma = 0,      -- smoothed real speed from the raw positions
+        rested = false,    -- a landed ball has settled (so a launch brings it back to life)
+        restTime = 0,
         changeFrames = 0,
         lastDebug = 0,
         dead = false,   -- landed: ignored for good (no marker, arc, or walking)
@@ -679,7 +689,7 @@ local function updateMotion(data, part, baseGravity)
     if data.fitPos then
         local tau = now - data.fitTime
         local expected = data.fitPos + data.fitVel * tau + 0.5 * gravity * tau * tau
-        local allowed = RESET_ERROR + data.fitVel.Magnitude * 0.06
+        local allowed = RESET_ERROR + data.fitVel.Magnitude * 0.09
         if (pos - expected).Magnitude > allowed then
             table.clear(history)
             data.fitPos = nil
@@ -736,7 +746,7 @@ local function updateMotion(data, part, baseGravity)
             local expected = fitPos + fitVel * tau + 0.5 * gravity * tau * tau
             maxResidual = math.max(maxResidual, (s.pos - expected).Magnitude)
         end
-        data.clean = maxResidual <= CLEAN_TOLERANCE + fitVel.Magnitude * 0.03
+        data.clean = maxResidual <= CLEAN_TOLERANCE + fitVel.Magnitude * 0.04
 
         -- Is the velocity estimate steady? Compare with a moment ago (allowing for gravity). Right after
         -- a hit the estimate is still catching up, and locking on it gives a wrong spot under the ball.
@@ -750,7 +760,7 @@ local function updateMotion(data, part, baseGravity)
         data.velStable = false
         if age >= STABLE_WINDOW * 0.8 then
             local expected = old.v + gravity * age
-            data.velStable = (fitVel - expected).Magnitude <= STABLE_TOLERANCE + fitVel.Magnitude * 0.04
+            data.velStable = (fitVel - expected).Magnitude <= STABLE_TOLERANCE + fitVel.Magnitude * 0.05
         end
 
         return fitPos, fitVel, bounced, gravity
@@ -911,6 +921,38 @@ local function lockDeviation(lock, pos, expected)
     return math.sqrt(along * along + diff.Y * diff.Y + side * side)
 end
 
+-- Where the ball should be if the range correction is ignored, i.e. what the ball itself is doing.
+-- (The drawn arc is stretched by the correction; comparing the ball with the stretched arc would
+-- wrongly look like "the ball left its path" on fast throws.)
+local function rawExpectedPosition(lock, now)
+    local tau = now - lock.time
+    return lock.rawP0 + lock.rawV0 * tau + 0.5 * lock.g * tau * tau
+end
+
+-- Brings a landed ball back to life with a clean slate
+local function reviveBall(data, why)
+    data.dead = false
+    data.wasAirborne = false
+    data.groundTime = 0
+    data.lastGap = nil
+    data.lock = nil
+    data.landing = nil
+    data.straightDown = false
+    data.rested = false
+    data.restTime = 0
+    data.relockAt = 0
+    data.fitPos = nil
+    data.fitSince = nil
+    data.velStable = false
+    data.clean = false
+    data.fastVel = nil
+    data.changeFrames = 0
+    table.clear(data.history)
+    table.clear(data.velTrail)
+    table.clear(data.evTrail)
+    if DEBUG then print("[BallTracker] ball revived (" .. why .. ")") end
+end
+
 -- Is this ball about to hit the floor so soon that waiting for the usual checks would be too late?
 -- (a very fast ball coming down at a sharp angle). Cheap: one downward cast plus a little algebra.
 local function isUrgent(pos, engine, radius, g)
@@ -937,8 +979,11 @@ local function makeLock(pos, vel, radius, g, now, dir)
     local landing, points = predictLanding(pos, vel, radius, g)
     if not landing then return nil end
     if IGNORE_STRAIGHT_DOWN then
+        -- a spot right under a ball that is barely moving sideways = "falling straight down".
+        -- A fast ball WITH sideways speed (a steep spike) landing close by is legitimate, so it is kept.
+        local flatSpeed = Vector3.new(vel.X, 0, vel.Z).Magnitude
         local sideways = Vector3.new(landing.X - pos.X, 0, landing.Z - pos.Z).Magnitude
-        if sideways < STRAIGHT_DOWN_DISTANCE then return nil end
+        if flatSpeed < STRAIGHT_DOWN_SPEED * 3 and sideways < STRAIGHT_DOWN_DISTANCE then return nil end
     end
     return { landing = landing, points = points, time = now, dir = dir }
 end
@@ -957,6 +1002,29 @@ RunService.Heartbeat:Connect(function(dt)
         else
             local pos, vel, bounced, g = updateMotion(data, part, gravity)
             local radius = getRadius(data, part)
+
+            -- real movement from the raw positions (works even if the engine reports no velocity)
+            local rawPos = part.Position
+            local jump = data.lastRawPos and (rawPos - data.lastRawPos).Magnitude or 0
+            data.lastRawPos = rawPos
+            data.speedEma += ((dt > 0 and jump / dt or 0) - data.speedEma) * 0.3
+
+            if data.dead and REVIVE_BALLS then
+                -- A landed ball is ignored. It only comes back if it was reset to somewhere else, or if it has
+                -- settled and then gets launched again (a bounce right after landing is not enough).
+                local moving = math.max(data.speedEma, part.AssemblyLinearVelocity.Magnitude)
+                if jump > RESET_JUMP then
+                    reviveBall(data, "it was reset")
+                elseif moving < REST_SPEED then
+                    data.restTime += dt
+                    if data.restTime >= REST_TIME then data.rested = true end
+                else
+                    data.restTime = 0
+                    if data.rested and moving > LAUNCH_SPEED then
+                        reviveBall(data, "it was launched again")
+                    end
+                end
+            end
 
             if not data.dead then
                 -- Did it just land? Only real floor contact counts. Being close to the floor is not enough:
@@ -1005,6 +1073,7 @@ RunService.Heartbeat:Connect(function(dt)
                         -- 1) fast: a sudden jump in the engine's velocity, compared with where gravity alone
                         --    would have taken it over the last ~0.1 s (two frames in a row, to ignore a glitch)
                         local changed = false
+                        local why = ""
                         local engine = part.AssemblyLinearVelocity
                         if engine.Magnitude >= 1 then
                             local trail = data.evTrail
@@ -1022,16 +1091,19 @@ RunService.Heartbeat:Connect(function(dt)
                                     data.changeFrames = 0
                                 end
                                 changed = data.changeFrames >= 2
+                                if changed then why = "sudden velocity change" end
                             end
                         end
 
                         -- 2) backup (for balls whose engine velocity isn't useful): it left the locked path
                         if not changed then
-                            local expected = lockedPosition(lock, now)
-                            changed = lockDeviation(lock, pos, expected) > LOCK_TOLERANCE + vel.Magnitude * 0.05
+                            local expected = rawExpectedPosition(lock, now)
+                            changed = lockDeviation(lock, pos, expected) > LOCK_TOLERANCE + vel.Magnitude * 0.1
+                            if changed then why = "left its predicted path" end
                         end
 
                         if changed then
+                            if DEBUG then print("[BallTracker] marker dropped: " .. why) end
                             data.lock = nil
                             data.relockAt = now + LOCK_AFTER
                             lock = nil
@@ -1078,6 +1150,11 @@ RunService.Heartbeat:Connect(function(dt)
 
                         lock = makeLock(lockPos, correctedVel, radius, g, now, aimDir)
                         data.lock = lock
+                        if lock then
+                            lock.rawP0 = lockPos   -- the ball's own path (no range correction), used to spot a change of direction
+                            lock.rawV0 = aimedVel
+                            lock.g = g
+                        end
                         if lock and flatV.Magnitude > 1e-3 then
                             -- remember what was predicted, to compare with where the ball really lands
                             local flatDir = flatV.Unit
