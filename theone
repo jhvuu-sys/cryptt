@@ -17,7 +17,7 @@ local player = Players.LocalPlayer
 -- Key system: nothing below this section (no UI, no ball tracking, no input) runs until a valid key is entered
 ---------------------------------------------------------------------
 local VALID_KEYS = {
-    ["de4m"] = true,  -- put your keys here (case-sensitive)
+    ["deerm"] = true,  -- put your keys here (case-sensitive)
 }
 local KEY_MAX_ATTEMPTS = 3        -- wrong tries before a short lockout
 local KEY_LOCKOUT_SECONDS = 30
@@ -156,7 +156,7 @@ local MIN_SAMPLES = 4             -- need at least this many samples before trus
 local RESET_ERROR = 0.75          -- studs off the predicted arc before old samples are thrown out (launch, bounce, hit)
 local RECENCY_HALF_LIFE = 0.1     -- newer samples count more; every this many seconds an older sample counts half as much
 local AUTO_GRAVITY = true         -- learn how this ball really falls (custom gravity / lift) from its own flight
-local DEBUG = true               -- true = print the learned gravity scale (1 = normal Roblox gravity)
+local DEBUG = false               -- true = print the learned gravity scale (1 = normal Roblox gravity)
 local SMOOTHING = 12              -- (only when LOCK_LANDING = false) landing marker smoothing
 local SNAP_DISTANCE = 8           -- (only when LOCK_LANDING = false) landing jumps bigger than this snap instead of gliding
 local USE_SPHERECAST = true       -- account for the ball's size instead of tracing only its center
@@ -180,6 +180,8 @@ local FAST_TOLERANCE_PCT = 0.08
 local USE_INSTANT_LOCK = true     -- for very fast balls about to hit the floor: lock from the engine's velocity at once, without the usual checks
 local INSTANT_MIN_SPEED = 50      -- ...only balls at least this fast (studs/s)...
 local INSTANT_TIME = 0.4          -- ...that would reach the floor within this many seconds
+local USE_HIT_LOCK = true         -- lock on the VERY FIRST frame after a hit: the engine's velocity jumps abruptly, and that new velocity is used right away
+local HIT_JUMP = 25               -- studs/s: a one-frame velocity change bigger than this (plus 20% of the speed) counts as a fresh hit
 local CLEAN_TOLERANCE = 0.5       -- studs a sample may sit off the fitted arc (plus 4% of the speed) and still count as a "clean arc"
 local USE_FACING = true           -- use the facing line of the player under the ball (read just before the hit) for the ball's direction
 local FACING_CONE = 45            -- degrees: the hitter's facing line is trusted only if the ball is heading roughly that way (otherwise the ball's own direction is used)
@@ -348,6 +350,7 @@ local function addBall(inst)
         clean = false,  -- recent movement forms a clean arc
         evTrail = {},   -- recent engine velocities, used to spot a sudden change of direction
         lastRawPos = nil,  -- raw position last frame (to measure real movement and spot a reset)
+        prevEngine = nil,  -- engine velocity last frame (to spot a fresh hit)
         speedEma = 0,      -- smoothed real speed from the raw positions
         rested = false,    -- a landed ball has settled (so a launch brings it back to life)
         restTime = 0,
@@ -929,6 +932,21 @@ local function rawExpectedPosition(lock, now)
     return lock.rawP0 + lock.rawV0 * tau + 0.5 * lock.g * tau * tau
 end
 
+-- Forget the current marker and start fresh (the old samples are from before the change)
+local function dropLock(data, now, why)
+    if DEBUG then print("[BallTracker] marker dropped: " .. why) end
+    data.lock = nil
+    data.relockAt = now + LOCK_AFTER
+    table.clear(data.history)
+    data.fitPos = nil
+    data.fitSince = nil
+    table.clear(data.velTrail)
+    data.velStable = false
+    data.clean = false
+    table.clear(data.evTrail)
+    data.changeFrames = 0
+end
+
 -- Brings a landed ball back to life with a clean slate
 local function reviveBall(data, why)
     data.dead = false
@@ -947,6 +965,7 @@ local function reviveBall(data, why)
     data.clean = false
     data.fastVel = nil
     data.changeFrames = 0
+    data.prevEngine = nil
     table.clear(data.history)
     table.clear(data.velTrail)
     table.clear(data.evTrail)
@@ -1068,6 +1087,19 @@ RunService.Heartbeat:Connect(function(dt)
                     -- keep noting which way the player under the ball faces (also while locked: a second hit needs it)
                     captureHitter(data, pos, now)
 
+                    -- A fresh hit: the engine's velocity changes abruptly within ONE frame, far more than gravity could
+                    local engineNow = part.AssemblyLinearVelocity
+                    local justHit = false
+                    if USE_HIT_LOCK and data.prevEngine and dt > 0 and engineNow.Magnitude >= 1 then
+                        local expectedV = data.prevEngine + g * dt
+                        justHit = (engineNow - expectedV).Magnitude > HIT_JUMP + engineNow.Magnitude * 0.2
+                    end
+                    data.prevEngine = engineNow
+                    if justHit and lock then
+                        dropLock(data, now, "the ball was hit again")  -- the old marker is stale right now
+                        lock = nil
+                    end
+
                     -- Did the ball change direction? (hit again, deflected) Then the marker is stale: remove it now.
                     if lock and ALLOW_RELOCK then
                         -- 1) fast: a sudden jump in the engine's velocity, compared with where gravity alone
@@ -1103,19 +1135,8 @@ RunService.Heartbeat:Connect(function(dt)
                         end
 
                         if changed then
-                            if DEBUG then print("[BallTracker] marker dropped: " .. why) end
-                            data.lock = nil
-                            data.relockAt = now + LOCK_AFTER
+                            dropLock(data, now, why)
                             lock = nil
-                            -- start fresh: the old samples are from before the change
-                            table.clear(data.history)
-                            data.fitPos = nil
-                            data.fitSince = nil
-                            table.clear(data.velTrail)
-                            data.velStable = false
-                            data.clean = false
-                            table.clear(data.evTrail)
-                            data.changeFrames = 0
                         end
                     end
 
@@ -1126,11 +1147,14 @@ RunService.Heartbeat:Connect(function(dt)
                     --   * the hitter's facing line  -> which way the ball goes
                     --   * the measured speed/height -> how far it goes
                     local lockVel, source, urgent = nil, nil, false
-                    if not lock and USE_INSTANT_LOCK then
-                        -- very fast ball about to hit the floor: there is no time to wait, use the engine's velocity now
-                        local engine = part.AssemblyLinearVelocity
-                        if isUrgent(part.Position, engine, radius, g) then
-                            lockVel, source, urgent = engine, "engine velocity (urgent)", true
+                    if not lock then
+                        local engineFlat = Vector3.new(engineNow.X, 0, engineNow.Z).Magnitude
+                        if justHit and engineFlat >= STRAIGHT_DOWN_SPEED then
+                            -- fresh hit: lock on the very first frame, from the new velocity
+                            lockVel, source, urgent = engineNow, "engine velocity (fresh hit)", true
+                        elseif USE_INSTANT_LOCK and isUrgent(part.Position, engineNow, radius, g) then
+                            -- very fast ball about to hit the floor: no time to wait
+                            lockVel, source, urgent = engineNow, "engine velocity (urgent)", true
                         end
                     end
                     if not lockVel and data.fastVel then
