@@ -17,7 +17,7 @@ local player = Players.LocalPlayer
 -- Key system: nothing below this section (no UI, no ball tracking, no input) runs until a valid key is entered
 ---------------------------------------------------------------------
 local VALID_KEYS = {
-    ["bachooo"] = true,  -- put your keys here (case-sensitive)
+    ["CHANGE-ME-1234"] = true,  -- put your keys here (case-sensitive)
 }
 local KEY_MAX_ATTEMPTS = 3        -- wrong tries before a short lockout
 local KEY_LOCKOUT_SECONDS = 30
@@ -165,26 +165,31 @@ local SCALE_FORGET = 0.999        -- how slowly old flights are forgotten while 
 local GRAVITY_OVERRIDE = nil      -- set a number to force the ball's gravity (turns AUTO_GRAVITY off)
 
 local LOCK_LANDING = true         -- true = pick the landing spot ONCE, then keep it fixed; false = keep re-estimating (jittery)
-local LOCK_AFTER = 0.06           -- seconds of clean flight to watch before locking (more = more accurate, but the marker appears later)
+local LOCK_AFTER = 0.06           -- (only with ALLOW_RELOCK) seconds to wait before re-picking after a lock was dropped
 local LOCK_TOLERANCE = 5          -- studs the ball may drift from the locked path before the spot is re-picked (more = steadier)
 local IGNORE_STRAIGHT_DOWN = true -- ignore balls that are only falling straight down (no marker, arc, highlight, or walking)
 local STRAIGHT_DOWN_SPEED = 4     -- sideways speed (studs/s) below this counts as "straight down"
 local STRAIGHT_DOWN_DISTANCE = 3  -- a predicted spot closer than this (sideways) to the ball is "right under it" and never locked
 local STABLE_WINDOW = 0.06        -- the ball's velocity estimate must stay steady this long before locking (avoids locking on a half-updated estimate right after a hit)
 local STABLE_TOLERANCE = 2        -- studs/s of wobble (plus 4% of the speed) still counted as "steady"
-local USE_FACING = true           -- lock a first guess sooner by reading which way the nearest player is facing
-local FACING_RANGE = 15           -- the nearest player within this many studs of the ball counts as the hitter
+local USE_FAST_LOCK = true        -- lock right away when the engine's own velocity agrees with how the ball really moved (a few frames after the hit)
+local FAST_MIN_SAMPLES = 3        -- ...checked over at least this many samples
+local FAST_MIN_SPAN = 0.03        -- ...spanning at least this many seconds
+local FAST_TOLERANCE = 3          -- studs/s the engine velocity may differ from the measured one (plus FAST_TOLERANCE_PCT of the speed)
+local FAST_TOLERANCE_PCT = 0.08
+local CLEAN_TOLERANCE = 0.5       -- studs a sample may sit off the fitted arc (plus 3% of the speed) and still count as a "clean arc"
+local USE_FACING = true           -- use the facing line of the player under the ball (read just before the hit) for the ball's direction
 local FACING_CONE = 45            -- degrees: the hitter's facing line is trusted only if the ball is heading roughly that way (otherwise the ball's own direction is used)
 local HITDIR_MAX_AGE = 1          -- seconds the hitter's facing (read just BEFORE the hit) stays usable
 local AIM_SIDE_ALLOWANCE = 25     -- studs the ball may drift sideways off the facing line before a locked spot is dropped
-local REFINE_DISTANCE = 2         -- when the steady estimate arrives, an early lock is replaced only if it was off by more than this (studs)
-local USE_PREHIT = true           -- BEFORE a hit: if a player is under the ball, estimate the landing from where they face
+local ALLOW_RELOCK = false        -- false = exactly ONE marker per ball, never replaced; true = re-pick it if the ball leaves the locked path (e.g. hit again)
 local HITTER_RADIUS = 5           -- a player counts as "under the ball" within this sideways distance (studs)...
 local HITTER_REACH = 12           -- ...and when the ball is no more than this far above them
 local HITTER_MIDAIR_ONLY = true   -- true = only players who are in the air; false = standing players count too
-local PREHIT_STEP = 4              -- the pre-hit estimate only moves when it changes by more than this (studs), so it stays steady
-local DEFAULT_HIT_SPEED = 40      -- until real hits have been seen: typical sideways speed of a hit ball (studs/s)
-local DEFAULT_HIT_VY = 25         -- ...and typical upward speed (studs/s)
+
+local LEARN_RANGE = true          -- learn from where balls really land: if fast balls usually land longer than predicted, future predictions are stretched to match
+local RANGE_SPEED_FACTOR = nil    -- manual instead: range multiplier = 1 + this * sideways speed (e.g. 0.0012 = +12% at 100 studs/s). nil = learn it automatically
+local RANGE_FORGET = 0.97         -- how quickly old landings are forgotten (per landing)
 
 local TOUCH_GAP = 0.3             -- a ball only counts as landed when its surface is this close to the floor (studs); merely being near is not enough
 local FLOOR_REST_TIME = 0.15      -- ...or when it has stayed on the floor this long (rolling along it)
@@ -326,11 +331,11 @@ local function addBall(inst)
         lastVy = 0,
         velTrail = {},         -- recent velocity estimates, used to tell when the estimate has settled
         velStable = false,
-        quickVel = nil,        -- rough early velocity (few samples), used for the facing-assisted early lock
-        preHit = nil,          -- the pre-hit landing estimate currently shown
         hitDir = nil,          -- horizontal direction the hitter faced just before the hit
         hitDirTime = 0,
         fitSince = nil, -- when the motion estimate became available
+        fastVel = nil,  -- the engine's velocity, once it has been checked against the real movement
+        clean = false,  -- recent movement forms a clean arc
         lastDebug = 0,
         dead = false,   -- landed: ignored for good (no marker, arc, or walking)
         marker = createMarker(),
@@ -635,6 +640,20 @@ local function fitGravityScale(history, baseG)
     return (-2 * c2) / baseG  -- height = c0 + c1*t + c2*t^2, so downward acceleration = -2*c2
 end
 
+-- The engine's own velocity, but only if it agrees with how the ball really moved over the last few samples
+-- (this guards against a stale, zero, or wrong reading). Returns nil if it can't be trusted yet.
+local function validatedEngineVelocity(history, part, gravity)
+    local engine = part.AssemblyLinearVelocity
+    local speed = engine.Magnitude
+    if speed < 1 then return nil end
+
+    local _, measured = fitMotion(history, gravity, FAST_MIN_SAMPLES, FAST_MIN_SPAN)
+    if not measured then return nil end
+
+    if (engine - measured).Magnitude > FAST_TOLERANCE + speed * FAST_TOLERANCE_PCT then return nil end
+    return engine
+end
+
 -- Returns the smoothed position, velocity, whether the ball just left its arc (launch, bounce, hit),
 -- and the gravity to use for this ball
 local function updateMotion(data, part, baseGravity)
@@ -692,11 +711,26 @@ local function updateMotion(data, part, baseGravity)
         end
     end
 
+    -- Fast path: can the engine's own velocity be trusted right now? (only needed until the ball is locked)
+    if USE_FAST_LOCK and not data.lock and not data.dead then
+        data.fastVel = validatedEngineVelocity(history, part, gravity)
+    else
+        data.fastVel = nil
+    end
+
     local fitPos, fitVel = fitMotion(history, gravity)
     if fitPos then
         data.fitPos, data.fitVel, data.fitTime = fitPos, fitVel, now
         data.fitSince = data.fitSince or now
-        data.quickVel = nil
+
+        -- Does the recent movement form a clean arc? Then waiting longer would add nothing.
+        local maxResidual = 0
+        for _, s in ipairs(history) do
+            local tau = s.t - now
+            local expected = fitPos + fitVel * tau + 0.5 * gravity * tau * tau
+            maxResidual = math.max(maxResidual, (s.pos - expected).Magnitude)
+        end
+        data.clean = maxResidual <= CLEAN_TOLERANCE + fitVel.Magnitude * 0.03
 
         -- Is the velocity estimate steady? Compare with a moment ago (allowing for gravity). Right after
         -- a hit the estimate is still catching up, and locking on it gives a wrong spot under the ball.
@@ -721,12 +755,7 @@ local function updateMotion(data, part, baseGravity)
     data.fitSince = nil
     table.clear(data.velTrail)
     data.velStable = false
-    if USE_FACING then
-        local _, quickVel = fitMotion(history, gravity, 3, 0.03)  -- rough, from just 3 samples
-        data.quickVel = quickVel
-    else
-        data.quickVel = nil
-    end
+    data.clean = false
     local vel = part.AssemblyLinearVelocity
     local n = #history
     if vel.Magnitude < 1 and n >= 2 then
@@ -767,18 +796,6 @@ local function remainingPath(lock, now)
     return out, i + 1
 end
 
--- What a typical hit looks like, learned from the real hits seen so far (used for the pre-hit estimate)
-local typicalHitFlat = DEFAULT_HIT_SPEED
-local typicalHitVy = DEFAULT_HIT_VY
-
-local function learnHit(vel, g)
-    local flat = Vector3.new(vel.X, 0, vel.Z).Magnitude
-    if flat < STRAIGHT_DOWN_SPEED then return end
-    typicalHitFlat += (flat - typicalHitFlat) * 0.25
-    -- the velocity is read a moment after the hit, so add back what gravity already took off
-    typicalHitVy += ((vel.Y - g.Y * 0.1) - typicalHitVy) * 0.25
-end
-
 -- A player under the ball (in the air by default) who is about to hit it
 local function findHitterUnder(pos)
     local best, bestDist = nil, HITTER_RADIUS
@@ -799,34 +816,54 @@ local function findHitterUnder(pos)
     return best
 end
 
--- Approximate landing before the hit: the hitter's facing direction + a typical hit's speed and height
-local function preHitLanding(data, pos, radius, g)
-    local hrp = findHitterUnder(pos)
-    if not hrp then
-        data.preHit = nil
-        return nil
-    end
+-- Range correction, learned from real landings:  factor = a + b * (sideways speed at the lock).
+-- Flat, fast shots come down at a shallow angle, so tiny errors in height or fall rate turn into big errors
+-- in range. They tend to be wrong in the same direction every time, which can be measured and corrected.
+local rangeStats = { sw = 6, sx = 300, sy = 6, sxx = 30000, sxy = 300 }  -- starts as "factor 1 at every speed"
 
-    local look = Vector3.new(hrp.CFrame.LookVector.X, 0, hrp.CFrame.LookVector.Z)
-    if look.Magnitude < 1e-3 then
-        data.preHit = nil
-        return nil
-    end
-    look = look.Unit
+local function recordRange(speed, factor)
+    local s = rangeStats
+    s.sw = s.sw * RANGE_FORGET + 1
+    s.sx = s.sx * RANGE_FORGET + speed
+    s.sy = s.sy * RANGE_FORGET + factor
+    s.sxx = s.sxx * RANGE_FORGET + speed * speed
+    s.sxy = s.sxy * RANGE_FORGET + speed * factor
+end
 
-    local landing = predictLanding(pos, Vector3.new(look.X * typicalHitFlat, typicalHitVy, look.Z * typicalHitFlat), radius, g)
-    if not landing then
-        data.preHit = nil
-        return nil
+local function rangeFactor(speed)
+    if RANGE_SPEED_FACTOR then
+        return math.clamp(1 + RANGE_SPEED_FACTOR * speed, 0.7, 1.6)
     end
+    if not LEARN_RANGE then return 1 end
 
-    -- keep the shown spot steady unless the estimate really moves (the hitter turning)
-    local shown = data.preHit
-    if shown and (landing - shown).Magnitude < PREHIT_STEP then
-        return shown
+    local s = rangeStats
+    local det = s.sw * s.sxx - s.sx * s.sx
+    if det < 1e-6 then return 1 end
+    local b = (s.sw * s.sxy - s.sx * s.sy) / det
+    local a = (s.sy - b * s.sx) / s.sw
+    return math.clamp(a + b * speed, 0.8, 1.4)
+end
+
+-- A ball just hit the floor: compare where it really landed with what was predicted
+local function learnRange(data, pos)
+    local lock = data.lock
+    if not lock or not lock.predRange or lock.predRange < 8 then return end
+
+    local dx, dz = pos.X - lock.start.X, pos.Z - lock.start.Z
+    local along = dx * lock.flatDir.X + dz * lock.flatDir.Z
+    local lateral = math.abs(dx * lock.flatDir.Z - dz * lock.flatDir.X)
+    local ratio = along / lock.predRange
+
+    -- ignore interrupted flights (hit again, deflected): wild ratios, or far off the line
+    if ratio < 0.7 or ratio > 1.5 or lateral > 3 + lock.predRange * 0.25 then return end
+
+    if LEARN_RANGE and not RANGE_SPEED_FACTOR then
+        recordRange(lock.flatSpeed, lock.factor * ratio)  -- the factor that would have been exactly right
     end
-    data.preHit = landing
-    return landing
+    if DEBUG then
+        print(string.format("[BallTracker] landed at %.0f%% of the predicted range (sideways speed %.0f studs/s, correction used x%.2f)",
+            ratio * 100, lock.flatSpeed, lock.factor))
+    end
 end
 
 -- Remember which way the player under the ball is facing, so it is still known after the hit
@@ -879,33 +916,6 @@ local function makeLock(pos, vel, radius, g, now, dir)
     return { landing = landing, points = points, time = now, dir = dir }
 end
 
--- The horizontal direction the nearest player (the likely hitter) is facing, but only if the ball is
--- already heading roughly that way. Facing never overrides what the ball is actually doing.
-local function facingDirection(pos, vel)
-    local flat = Vector3.new(vel.X, 0, vel.Z)
-    if flat.Magnitude < 1e-3 then return nil end
-    local heading = flat.Unit
-
-    local nearest, nearestDist = nil, FACING_RANGE
-    for _, plr in ipairs(Players:GetPlayers()) do
-        local char = plr.Character
-        local hrp = char and char:FindFirstChild("HumanoidRootPart")
-        if hrp then
-            local d = (hrp.Position - pos).Magnitude
-            if d < nearestDist then
-                nearest, nearestDist = hrp, d
-            end
-        end
-    end
-    if not nearest then return nil end
-
-    local look = Vector3.new(nearest.CFrame.LookVector.X, 0, nearest.CFrame.LookVector.Z)
-    if look.Magnitude < 1e-3 then return nil end
-    look = look.Unit
-    if look:Dot(heading) < math.cos(math.rad(FACING_CONE)) then return nil end
-    return look
-end
-
 RunService.Heartbeat:Connect(function(dt)
     rayParams = buildRayParams()  -- once per frame, shared by every ball
     local gravity = Vector3.new(0, -(GRAVITY_OVERRIDE or Workspace.Gravity), 0)
@@ -940,6 +950,7 @@ RunService.Heartbeat:Connect(function(dt)
 
                 if data.wasAirborne and ((touching and vy <= 5) or bouncedOff) then
                     data.dead = true  -- permanent: the bounce is ignored from here on
+                    learnRange(data, pos)
                 elseif data.groundTime >= FLOOR_REST_TIME then
                     data.dead = true  -- sitting / rolling on the floor
                 end
@@ -952,17 +963,18 @@ RunService.Heartbeat:Connect(function(dt)
                 hideBall(data)  -- no marker, no arc, nothing to walk to
             else
                 local landing, points, startAbs
-                local estimate = false  -- true while the shown spot is only a pre-hit guess
                 local flatSpeed = Vector3.new(vel.X, 0, vel.Z).Magnitude
                 local straightDown = IGNORE_STRAIGHT_DOWN and flatSpeed < STRAIGHT_DOWN_SPEED
 
                 if LOCK_LANDING then
                     local now = os.clock()
                     local lock = data.lock
+
+                    -- before the lock: keep noting which way the player under the ball faces
                     if not lock then captureHitter(data, pos, now) end
 
-                    -- drop the lock if the ball has left the locked path (hit, deflected, or well off)
-                    if lock then
+                    -- (only if ALLOW_RELOCK) drop the lock when the ball has left the locked path
+                    if lock and ALLOW_RELOCK then
                         local expected = lockedPosition(lock, now)
                         if lockDeviation(lock, pos, expected) > LOCK_TOLERANCE + vel.Magnitude * 0.05 then
                             data.lock = nil
@@ -977,65 +989,46 @@ RunService.Heartbeat:Connect(function(dt)
                         end
                     end
 
-                    -- steady estimate available: take a lock, or check an early one against it
-                    if data.velStable and not straightDown and data.fitSince
-                        and now - data.fitSince >= LOCK_AFTER and now >= data.relockAt then
-                        if not lock then
-                            local aimedVel, aimDir = aimedVelocity(data, vel, now)
-                            lock = makeLock(pos, aimedVel, radius, g, now, aimDir)
-                            data.lock = lock
-                            if lock then learnHit(vel, g) end
-                        elseif lock.early then
-                            -- replace the early guess only if it was clearly off (at most one adjustment)
-                            local aimedVel, aimDir = aimedVelocity(data, vel, now)
-                            local refined = makeLock(pos, aimedVel, radius, g, now, aimDir)
-                            if refined then
-                                local off = Vector3.new(refined.landing.X - lock.landing.X, 0,
-                                    refined.landing.Z - lock.landing.Z).Magnitude
-                                if off > REFINE_DISTANCE then
-                                    lock = refined
-                                    data.lock = lock
-                                    learnHit(vel, g)
-                                end
-                            end
-                            lock.early = nil
-                        end
+                    -- THE one lock, taken as soon as the data can be trusted (not after a fixed wait):
+                    --   fast path: the engine's velocity was checked against the real movement
+                    --   fit path : the recent samples form a clean, steady arc
+                    -- then combine
+                    --   * the hitter's facing line  -> which way the ball goes
+                    --   * the measured speed/height -> how far it goes
+                    local lockVel = data.fastVel
+                    if not lockVel and data.fitSince and data.velStable and data.clean then
+                        lockVel = vel
                     end
+                    if not lock and not straightDown and lockVel and now >= data.relockAt then
+                        local aimedVel, aimDir = aimedVelocity(data, lockVel, now)
 
-                    -- Not steady yet: lock an early guess from the hitter's facing direction
-                    if not lock and USE_FACING and data.quickVel and now >= data.relockAt then
-                        local qv = data.quickVel
-                        local qFlat = Vector3.new(qv.X, 0, qv.Z).Magnitude
-                        if qFlat >= STRAIGHT_DOWN_SPEED then
-                            -- the hitter seen under the ball before the hit, else whoever is nearest now
-                            local aimedVel, dir = aimedVelocity(data, qv, now)
-                            if not dir then
-                                dir = facingDirection(pos, qv)
-                                if dir then aimedVel = Vector3.new(dir.X * qFlat, qv.Y, dir.Z * qFlat) end
-                            end
-                            if dir then
-                                -- measured speed and height, but the cleaner facing direction
-                                local early = makeLock(pos, aimedVel, radius, g, now, dir)
-                                if early then
-                                    early.early = true
-                                    lock = early
-                                    data.lock = lock
-                                end
-                            end
+                        -- stretch (or shrink) the range by what past landings say about balls this fast
+                        local flatV = Vector3.new(aimedVel.X, 0, aimedVel.Z)
+                        local factor = rangeFactor(flatV.Magnitude)
+                        local correctedVel = Vector3.new(aimedVel.X * factor, aimedVel.Y, aimedVel.Z * factor)
+
+                        lock = makeLock(pos, correctedVel, radius, g, now, aimDir)
+                        data.lock = lock
+                        if lock and flatV.Magnitude > 1e-3 then
+                            -- remember what was predicted, to compare with where the ball really lands
+                            local flatDir = flatV.Unit
+                            lock.start = pos
+                            lock.flatDir = flatDir
+                            lock.flatSpeed = flatV.Magnitude
+                            lock.factor = factor
+                            lock.predRange = (lock.landing.X - pos.X) * flatDir.X + (lock.landing.Z - pos.Z) * flatDir.Z
+                        end
+                        if lock and DEBUG then
+                            local first = data.history[1]
+                            print(string.format("[BallTracker] locked via %s, %.0f ms after the first sample of this flight",
+                                data.fastVel and "engine velocity" or "fitted velocity",
+                                (now - (first and first.t or now)) * 1000))
                         end
                     end
 
                     if lock then
                         landing = lock.landing
                         points, startAbs = remainingPath(lock, now)
-                        data.preHit = nil
-                    elseif USE_PREHIT then
-                        -- nothing real to lock yet: is a player under the ball about to hit it?
-                        local guess = preHitLanding(data, pos, radius, g)
-                        if guess then
-                            landing = guess
-                            estimate = true
-                        end
                     end
                 else
                     if not straightDown then
@@ -1051,11 +1044,11 @@ RunService.Heartbeat:Connect(function(dt)
                 end
 
                 data.landing = landing
-                data.straightDown = straightDown and not data.lock and not estimate  -- an already-locked ball is never dropped
+                data.straightDown = straightDown and not data.lock  -- an already-locked ball is never dropped
 
                 -- the panel switches only control what is drawn; tracking (and walking) keeps running
                 if enabled and landing then
-                    data.marker.Transparency = estimate and 0.6 or 0.35  -- fainter while it is only a guess
+                    data.marker.Transparency = 0.35
                     data.marker.CFrame = CFrame.new(landing + Vector3.new(0, 0.1, 0))
                         * CFrame.Angles(0, 0, math.rad(90))
                 else
