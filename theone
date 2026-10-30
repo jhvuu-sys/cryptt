@@ -182,6 +182,8 @@ local INSTANT_MIN_SPEED = 50      -- ...only balls at least this fast (studs/s).
 local INSTANT_TIME = 0.4          -- ...that would reach the floor within this many seconds
 local USE_HIT_LOCK = true         -- lock on the VERY FIRST frame after a hit: the engine's velocity jumps abruptly, and that new velocity is used right away
 local HIT_JUMP = 25               -- studs/s: a one-frame velocity change bigger than this (plus 20% of the speed) counts as a fresh hit
+local USE_FALLBACK_LOCK = true    -- safety net: if the usual checks never trust a ball's data, lock anyway after FALLBACK_DELAY (a slightly rougher marker beats none)
+local FALLBACK_DELAY = 0.12       -- seconds a ball must be flying with no marker before the safety net kicks in
 local CLEAN_TOLERANCE = 0.5       -- studs a sample may sit off the fitted arc (plus 4% of the speed) and still count as a "clean arc"
 local USE_FACING = true           -- use the facing line of the player under the ball (read just before the hit) for the ball's direction
 local FACING_CONE = 45            -- degrees: the hitter's facing line is trusted only if the ball is heading roughly that way (otherwise the ball's own direction is used)
@@ -318,7 +320,12 @@ local function addBall(inst)
     if balls[inst] then return end
     if inst.Name ~= BALL_NAME then return end
     if not (inst:IsA("BasePart") or inst:IsA("Model")) then return end
-    if ballCount >= MAX_BALLS then return end
+    -- the cap counts only balls still in play, so landed balls lying around can't use up the slots
+    local inPlay = 0
+    for _, other in pairs(balls) do
+        if not other.dead then inPlay += 1 end
+    end
+    if inPlay >= MAX_BALLS then return end
 
     local folder = Instance.new("Folder")
     folder.Name = "Arc"
@@ -351,6 +358,7 @@ local function addBall(inst)
         evTrail = {},   -- recent engine velocities, used to spot a sudden change of direction
         lastRawPos = nil,  -- raw position last frame (to measure real movement and spot a reset)
         prevEngine = nil,  -- engine velocity last frame (to spot a fresh hit)
+        freeSince = nil,   -- since when the ball has been flying with no marker (for the safety net)
         speedEma = 0,      -- smoothed real speed from the raw positions
         rested = false,    -- a landed ball has settled (so a launch brings it back to life)
         restTime = 0,
@@ -936,6 +944,7 @@ end
 local function dropLock(data, now, why)
     if DEBUG then print("[BallTracker] marker dropped: " .. why) end
     data.lock = nil
+    data.freeSince = nil
     data.relockAt = now + LOCK_AFTER
     table.clear(data.history)
     data.fitPos = nil
@@ -966,6 +975,7 @@ local function reviveBall(data, why)
     data.fastVel = nil
     data.changeFrames = 0
     data.prevEngine = nil
+    data.freeSince = nil
     table.clear(data.history)
     table.clear(data.velTrail)
     table.clear(data.evTrail)
@@ -1007,8 +1017,28 @@ local function makeLock(pos, vel, radius, g, now, dir)
     return { landing = landing, points = points, time = now, dir = dir }
 end
 
+local statusTimer = 0
+
 RunService.Heartbeat:Connect(function(dt)
     rayParams = buildRayParams()  -- once per frame, shared by every ball
+
+    if DEBUG then
+        statusTimer += dt
+        if statusTimer >= 1 then
+            statusTimer = 0
+            local alive, withMarker, landed = 0, 0, 0
+            for _, b in pairs(balls) do
+                if b.dead then
+                    landed += 1
+                else
+                    alive += 1
+                    if b.lock then withMarker += 1 end
+                end
+            end
+            print(string.format("[BallTracker] tracking %d balls: %d in play (%d with a marker), %d landed",
+                alive + landed, alive, withMarker, landed))
+        end
+    end
     local gravity = Vector3.new(0, -(GRAVITY_OVERRIDE or Workspace.Gravity), 0)
 
     for inst, data in pairs(balls) do
@@ -1162,6 +1192,17 @@ RunService.Heartbeat:Connect(function(dt)
                     end
                     if not lockVel and data.fitSince and data.velStable and data.clean then
                         lockVel, source = vel, "fitted velocity"
+                    end
+
+                    -- Safety net: how long has this ball been flying without a marker?
+                    if lock or straightDown then
+                        data.freeSince = nil
+                    else
+                        data.freeSince = data.freeSince or now
+                    end
+                    if not lockVel and USE_FALLBACK_LOCK and data.freeSince and now - data.freeSince >= FALLBACK_DELAY
+                        and vel.Magnitude >= 1 then
+                        lockVel, source = vel, "fallback (the data never looked clean enough)"
                     end
                     if not lock and lockVel and (urgent or (not straightDown and now >= data.relockAt)) then
                         local lockPos = urgent and part.Position or pos
